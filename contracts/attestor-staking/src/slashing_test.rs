@@ -1,4 +1,3 @@
-#![cfg(test)]
 use super::*;
 use soroban_sdk::{testutils::{Address as _, Ledger as _}, token, Address, Env};
 use soroban_sdk::{contract, contractimpl};
