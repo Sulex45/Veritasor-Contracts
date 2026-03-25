@@ -152,3 +152,49 @@ Existing admin functions (`configure_fees`, `set_tier_discount`, `set_business_t
 
 This flow provides an on-chain, token-gated, and quorum-enforced path for adjusting protocol fee parameters.
 
+## Cross-Role Authorization Model
+
+The ProtocolDao enforces a strict cross-role authorization model to maintain governance integrity.
+
+### Role Definitions
+
+| Role | Description | Token Required |
+|------|-------------|----------------|
+| Admin | DAO administrator with elevated privileges | No |
+| Creator | Address that creates a proposal | Yes (if token configured) |
+| Voter | Address that votes for or against proposals | Yes (if token configured) |
+| Executor | Address that executes an approved proposal | No |
+
+### Permission Matrix
+
+| Operation | Admin | Token Holder | Non-Token Holder |
+|-----------|-------|--------------|------------------|
+| `set_governance_token` | Yes | No | No |
+| `set_voting_config` | Yes | No | No |
+| `create_*_proposal` | Via token | Yes | No* |
+| `vote_for` / `vote_against` | Via token | Yes | No* |
+| `execute_proposal` | Yes | Yes | Yes |
+| `cancel_proposal` (own) | Yes | Yes | N/A |
+| `cancel_proposal` (other) | Yes | No | No |
+
+\* When no governance token is configured, anyone can create proposals and vote.
+
+### Authorization Invariants
+
+1. **Token Gating Isolation**: When a governance token is configured, only addresses with a positive token balance can create proposals or vote. The admin role alone does not grant voting privileges.
+
+2. **Cancel Authority**: Only the proposal creator or the DAO admin can cancel a pending proposal. Other token holders cannot cancel proposals they did not create.
+
+3. **Execute Permissionlessness**: Any address can execute a proposal if it meets quorum and has strict majority approval. This enables trustless execution once governance requirements are satisfied.
+
+4. **Vote Finality**: Each address can vote exactly once per proposal. A vote cannot be changed or withdrawn after submission.
+
+5. **Lifecycle Enforcement**: Operations are only valid during the `Pending` status. Once a proposal is `Executed`, `Rejected`, or expired, no further state changes are permitted except read operations.
+
+### Security Assumptions
+
+- The governance token contract is trusted and correctly implements the Soroban token interface.
+- Token balance checks are performed at the time of each operation; balance changes after voting do not affect prior votes.
+- Proposal expiration is determined by ledger sequence comparison, which is monotonically increasing.
+- The admin address is trusted and secured; admin compromise could disrupt governance but cannot bypass quorum requirements for fee configuration changes.
+
