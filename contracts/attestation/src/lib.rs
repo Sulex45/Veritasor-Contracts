@@ -161,6 +161,21 @@ impl AttestationContract {
         env.storage().instance().get(&key)
     }
 
+    /// Convenience method to retrieve the proof hash for a specific attestation.
+    /// Returns `None` if the attestation does not exist or was submitted without a hash.
+    ///
+    /// # Arguments
+    ///
+    /// * `business` - The address of the business that submitted the attestation.
+    /// * `period` - The period string (e.g., "2026-Q1").
+    pub fn get_proof_hash(
+        env: Env,
+        business: Address,
+        period: String,
+    ) -> Option<BytesN<32>> {
+        Self::get_attestation(env, business, period).and_then(|data| data.4)
+    }
+
     pub fn is_expired(env: Env, business: Address, period: String) -> bool {
         if let Some((_, _, _, _, _, Some(expiry_ts))) = Self::get_attestation(env.clone(), business, period) {
             env.ledger().timestamp() >= expiry_ts
