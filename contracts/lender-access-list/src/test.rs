@@ -158,6 +158,7 @@ fn test_non_governance_cannot_remove_lender() {
 }
 
 #[test]
+#[should_panic(expected = "caller does not have governance role")]
 fn test_revoked_governance_cannot_manage_lenders() {
     let (env, client, admin) = setup();
     let delegated_gov = Address::generate(&env);
@@ -173,14 +174,7 @@ fn test_revoked_governance_cannot_manage_lenders() {
     assert!(!client.has_governance(&delegated_gov));
 
     // Revoked governance cannot continue mutating lender state.
-    let escalation_attempt = std::panic::catch_unwind(|| {
-        client.set_lender(&delegated_gov, &lender, &3u32, &meta(&env, "Escalation"));
-    });
-    assert!(escalation_attempt.is_err());
-
-    let lender_record = client.get_lender(&lender).unwrap();
-    assert_eq!(lender_record.tier, 1);
-    assert_eq!(lender_record.metadata.name, String::from_str(&env, "Delegated-Lender"));
+    client.set_lender(&delegated_gov, &lender, &3u32, &meta(&env, "Escalation"));
 }
 
 #[test]

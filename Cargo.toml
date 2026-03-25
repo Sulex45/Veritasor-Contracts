@@ -8,6 +8,7 @@ members = [
     "contracts/audit-log",
     "contracts/business-config",
     "contracts/integration-registry",
+    "contracts/lender-access-list",
     "contracts/network-config",
     "contracts/protocol-dao",
     "contracts/protocol-simulation",
