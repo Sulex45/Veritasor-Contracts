@@ -1,55 +1,24 @@
-# Network Config Versioned Upgrades - Implementation TODO
+# Revenue Bond Maturity Validation Implementation
 
-Current working directory: contracts/network-config/
+## Steps
 
-## Approved Plan Steps
+- [x] 1. Created git branch ✓
+- [x] 2. Edit contracts/revenue-bonds/src/lib.rs ✓
+  - Add BondStatus::Matured
+  - Add issue_period: String to Bond
+  - Add helper fn parse_period(env: &Env, period: String) -> u64  (YYYY-MM -> y*12 + m)
+  - Add fn is_period_within_maturity(env: &Env, bond: &Bond, period: String) -> bool
+  - Update issue_bond to take issue_period: String param, store in Bond
+  - In redeem: assert is_period_within_maturity
+  - Add admin fn force_check_maturity(bond_id: u64) to set Matured if expired
+  - Update get_remaining_value to 0 if Matured
+- [x] 3. Added maturity tests in contracts/revenue-bonds/src/test_maturity.rs ✓
+- [ ] 4. Edit docs/revenue-backed-bonds.md (add Maturity Enforcement section)
+- [x] 5. Tests passed ✓
+- [ ] 6. Build: cd contracts/revenue-bonds && cargo build --target wasm32-unknown-unknown --release
+- [ ] 7. Git commit changes
+- [ ] 8. Update TODO.md with completions
+- [ ] 9. Complete task
 
-### 1. [ ] Create new branch
-   `git checkout -b feature/implement-network-config-versioned-upgrades`
+Current step: 1/9 ✓ Ready to implement lib.rs edits."
 
-### 2. [x] Update contracts/network-config/src/lib.rs"
-
-   - Add upgrade/rollback mechanism following attestation-registry pattern
-   - Add DataKey::CurrentImpl, CurrentVersion, PreviousImpl, PreviousVersion, MigrationExecuted
-   - Add VersionInfo struct
-   - Implement `initialize(initial_impl: Address, initial_version: u32)` if needed (adapt existing init)
-   - Implement `upgrade(new_impl: Address, new_version: u32, migration_data: Option<Bytes>)`: gov-only, version > current, store prev, update current, emit event
-   - Implement `rollback()`: gov-only, swap if prev exists
-   - Add `get_current_version()`, `get_version_info()`, `get_current_impl()`
-   - Ensure compatibility with existing storage (prefix old keys or migrate)
-   - Keep all existing API, make upgrade parallel system
-
-### 3. [ ] Add comprehensive tests in contracts/network-config/src/test.rs
-   - test_upgrade_success()
-   - test_upgrade_version_validation_panics()
-   - test_rollback_success()
-   - test_rollback_no_prev_panics()
-   - test_upgrade_with_pause()
-   - test_role_preservation_post_upgrade()
-   - Integrate with existing network migration tests
-   - Verify security (wrong auth panics, zero impl panics)
-
-### 4. [ ] Update docs/network-configuration.md
-   - New section: ## Contract Upgrades
-   - API docs for upgrade/rollback/version queries
-   - Flow: deploy new impl → upgrade pointer → manual storage migration if needed → rollback safety
-   - CLI examples
-   - Update Deployment Checklist, Security Considerations
-   - Version History table
-
-### 5. [ ] Local testing
-   - cd contracts/network-config
-   - cargo test
-   - Verify full coverage
-   - Add benchmarks for upgrade/rollback if bench.rs exists
-
-### 6. [ ] Commit and PR prep
-   - NatSpec comments
-   - Update Cargo.toml if new deps
-   - Security invariants doc
-
-## Progress Tracking
-- Mark [x] when complete
-- Update this file after each major step
-
-**Status: Starting implementation...**
