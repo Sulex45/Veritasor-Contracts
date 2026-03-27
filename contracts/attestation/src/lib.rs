@@ -170,7 +170,8 @@ impl AttestationContract {
     }
 
     pub fn is_revoked(env: Env, business: Address, period: String) -> bool {
-        false
+        let key = DataKey::Revoked(business, period);
+        env.storage().instance().get(&key).unwrap_or(false)
     }
 
     pub fn revoke_attestation(
@@ -183,7 +184,20 @@ impl AttestationContract {
     ) {
         caller.require_auth();
         dynamic_fees::require_admin(&env);
-        // Minimal implementation for tests
+        
+        // Verify attestation exists before revoking
+        let key = DataKey::Attestation(business.clone(), period.clone());
+        if !env.storage().instance().has(&key) {
+            panic!("attestation not found");
+        }
+
+        let revoked_key = DataKey::Revoked(business.clone(), period.clone());
+        if env.storage().instance().get(&revoked_key).unwrap_or(false) {
+            panic!("attestation already revoked");
+        }
+
+        env.storage().instance().set(&revoked_key, &true);
+        
         events::emit_attestation_revoked(&env, &business, &period, &caller, &reason);
     }
 
