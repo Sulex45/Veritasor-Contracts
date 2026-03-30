@@ -153,6 +153,14 @@ impl RevenueCurveContract {
             policy.base_apr_bps >= policy.min_apr_bps && policy.base_apr_bps <= policy.max_apr_bps,
             "base_apr must be within [min_apr, max_apr]"
         );
+        assert!(
+            policy.max_apr_bps <= 10000,
+            "max_apr cannot exceed 10000 bps (100%)"
+        );
+        assert!(
+            policy.risk_premium_bps_per_point <= 1000,
+            "risk premium per point cannot exceed 1000 bps"
+        );
         env.storage()
             .instance()
             .set(&DataKey::PricingPolicy, &policy);
@@ -171,9 +179,12 @@ impl RevenueCurveContract {
     pub fn set_revenue_tiers(env: Env, admin: Address, tiers: Vec<RevenueTier>) {
         Self::require_admin(&env, &admin);
 
+        assert!(tiers.len() <= 20, "maximum of 20 tiers allowed");
+
         // Validate tiers are sorted and discounts are reasonable
         let mut prev_revenue: Option<i128> = None;
         for tier in tiers.iter() {
+            assert!(tier.min_revenue >= 0, "min_revenue cannot be negative");
             if let Some(prev) = prev_revenue {
                 assert!(
                     tier.min_revenue > prev,

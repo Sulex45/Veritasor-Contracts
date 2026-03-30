@@ -67,7 +67,14 @@ fn test_slash_success() {
     let contract_id = env.register(AttestorStakingContract, ());
     let client = AttestorStakingContractClient::new(&env, &contract_id);
 
-    client.initialize(&admin, &token_id, &treasury, &1000, &dispute_contract, &0u64);
+    client.initialize(
+        &admin,
+        &token_id,
+        &treasury,
+        &1000,
+        &dispute_contract,
+        &0u64,
+    );
     client.stake(&attestor, &5000);
 
     let initial_treasury_balance = token_client.balance(&treasury);
@@ -101,7 +108,14 @@ fn test_slash_partial_when_insufficient_stake() {
     let contract_id = env.register(AttestorStakingContract, ());
     let client = AttestorStakingContractClient::new(&env, &contract_id);
 
-    client.initialize(&admin, &token_id, &treasury, &1000, &dispute_contract, &0u64);
+    client.initialize(
+        &admin,
+        &token_id,
+        &treasury,
+        &1000,
+        &dispute_contract,
+        &0u64,
+    );
     client.stake(&attestor, &2000);
 
     let initial_treasury_balance = token_client.balance(&treasury);
@@ -136,7 +150,14 @@ fn test_slash_double_slashing_prevented() {
     let contract_id = env.register(AttestorStakingContract, ());
     let client = AttestorStakingContractClient::new(&env, &contract_id);
 
-    client.initialize(&admin, &token_id, &treasury, &1000, &dispute_contract, &0u64);
+    client.initialize(
+        &admin,
+        &token_id,
+        &treasury,
+        &1000,
+        &dispute_contract,
+        &0u64,
+    );
     client.stake(&attestor, &5000);
 
     env.as_contract(&dispute_contract, || {
@@ -164,7 +185,14 @@ fn test_slash_multiple_disputes() {
     let contract_id = env.register(AttestorStakingContract, ());
     let client = AttestorStakingContractClient::new(&env, &contract_id);
 
-    client.initialize(&admin, &token_id, &treasury, &1000, &dispute_contract, &0u64);
+    client.initialize(
+        &admin,
+        &token_id,
+        &treasury,
+        &1000,
+        &dispute_contract,
+        &0u64,
+    );
     client.stake(&attestor, &5000);
 
     let initial_treasury_balance = token_client.balance(&treasury);
@@ -200,7 +228,14 @@ fn test_slash_no_stake() {
     let contract_id = env.register(AttestorStakingContract, ());
     let client = AttestorStakingContractClient::new(&env, &contract_id);
 
-    client.initialize(&admin, &token_id, &treasury, &1000, &dispute_contract, &0u64);
+    client.initialize(
+        &admin,
+        &token_id,
+        &treasury,
+        &1000,
+        &dispute_contract,
+        &0u64,
+    );
 
     // Try to slash attestor with no stake - should panic
     let result = client.try_slash(&attestor, &1000, &1);
@@ -223,7 +258,14 @@ fn test_slash_zero_stake_returns_no_slash() {
     let contract_id = env.register(AttestorStakingContract, ());
     let client = AttestorStakingContractClient::new(&env, &contract_id);
 
-    client.initialize(&admin, &token_id, &treasury, &1000, &dispute_contract, &0u64);
+    client.initialize(
+        &admin,
+        &token_id,
+        &treasury,
+        &1000,
+        &dispute_contract,
+        &0u64,
+    );
     client.stake(&attestor, &1000);
 
     // Slash all stake
@@ -266,7 +308,14 @@ fn test_dispute_resolution_triggers_slashing() {
     let contract_id = env.register(AttestorStakingContract, ());
     let client = AttestorStakingContractClient::new(&env, &contract_id);
 
-    client.initialize(&admin, &token_id, &treasury, &1000, &dispute_contract, &0u64);
+    client.initialize(
+        &admin,
+        &token_id,
+        &treasury,
+        &1000,
+        &dispute_contract,
+        &0u64,
+    );
     client.stake(&attestor, &5000);
 
     let initial_treasury = token_client.balance(&treasury);
@@ -543,7 +592,14 @@ fn test_frivolous_slashing_blocked() {
     let contract_id = env.register(AttestorStakingContract, ());
     let client = AttestorStakingContractClient::new(&env, &contract_id);
 
-    client.initialize(&admin, &token_id, &treasury, &1000, &dispute_contract, &0u64);
+    client.initialize(
+        &admin,
+        &token_id,
+        &treasury,
+        &1000,
+        &dispute_contract,
+        &0u64,
+    );
     client.stake(&attestor, &5000);
 
     // Malicious caller tries to slash by impersonating a non-dispute contract.
