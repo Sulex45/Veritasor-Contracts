@@ -23,6 +23,8 @@ pub const NONCE_CHANNEL_BUSINESS: u32 = 1;
 
 pub const STATUS_ACTIVE: u32 = 0;
 pub const STATUS_REVOKED: u32 = 1;
+pub const STATUS_FILTER_ALL: u32 = 2;
+const QUERY_LIMIT_MAX: u32 = 30;
 
 // Type aliases to reduce complexity
 pub type AttestationData = (BytesN<32>, u64, u32, i128, Option<BytesN<32>>, Option<u64>);
@@ -81,6 +83,23 @@ pub struct BatchAttestationItem {
 
 #[contract]
 pub struct AttestationContract;
+
+/// Lexicographic comparison of Soroban strings.
+fn compare_strings(a: &String, b: &String) -> Ordering {
+    let a_len = a.len();
+    let b_len = b.len();
+    let min_len = if a_len < b_len { a_len } else { b_len };
+
+    for i in 0..min_len {
+        let byte_a = a.as_bytes().get(i).unwrap();
+        let byte_b = b.as_bytes().get(i).unwrap();
+        match byte_a.cmp(&byte_b) {
+            Ordering::Equal => continue,
+            other => return other,
+        }
+    }
+    a_len.cmp(&b_len)
+}
 
 #[contractimpl]
 impl AttestationContract {
