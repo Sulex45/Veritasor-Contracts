@@ -1,6 +1,8 @@
 #![no_std]
-use core::cmp::Ordering;
-use soroban_sdk::{contract, contractimpl, contracttype, Address, Bytes, BytesN, Env, String, Symbol, Vec};
+use soroban_sdk::{contract, contractimpl, contracttype, Address, BytesN, Env, String, Vec};
+
+#[cfg(test)]
+mod expiry_test;
 
 /// Attestor staking client: WASM import for wasm32, crate client for host builds.
 #[cfg(target_arch = "wasm32")]
@@ -11,22 +13,18 @@ mod attestor_staking_import {
     pub use Client as AttestorStakingContractClient;
 }
 
-#[cfg(not(target_arch = "wasm32"))]
-use veritasor_attestor_staking::AttestorStakingContractClient;
-
-#[cfg(target_arch = "wasm32")]
-use attestor_staking_import::AttestorStakingContractClient;
-
 const STATUS_KEY_TAG: u32 = 1;
 const ADMIN_KEY_TAG: (u32,) = (2,);
-const ANOMALY_KEY_TAG: u32 = 3;
-const AUTHORIZED_KEY_TAG: u32 = 4;
-const ESCALATION_KEY_TAG: u32 = 5;
-const QUERY_LIMIT_MAX: u32 = 30;
+const ANOMALY_KEY_TAG: (u32,) = (3,);
+const AUTHORIZED_KEY_TAG: (u32,) = (4,);
+const ANOMALY_SCORE_MAX: u32 = 100;
+pub const NONCE_CHANNEL_ADMIN: u32 = 0;
+pub const NONCE_CHANNEL_BUSINESS: u32 = 1;
 
 pub const STATUS_ACTIVE: u32 = 0;
 pub const STATUS_REVOKED: u32 = 1;
 pub const STATUS_FILTER_ALL: u32 = 2;
+const QUERY_LIMIT_MAX: u32 = 30;
 
 pub const ANOMALY_SCORE_MAX: u32 = 100;
 
@@ -48,7 +46,6 @@ use soroban_sdk::{contract, contractimpl, Address, BytesN, Env, String, Symbol, 
 pub type AttestationData = (BytesN<32>, u64, u32, i128, Option<BytesN<32>>, Option<u64>);
 pub type RevocationData = (Address, u64, String);
 pub type AttestationWithRevocation = (AttestationData, Option<RevocationData>);
-#[allow(dead_code)]
 pub type AttestationStatusResult = Vec<(String, Option<AttestationData>, Option<RevocationData>)>;
 use soroban_sdk::{contract, contractimpl, Address, BytesN, Env, String, Vec};
 use veritasor_common::replay_protection;
@@ -64,6 +61,9 @@ pub mod multisig;
 pub mod rate_limit;
 pub mod registry;
 // ─── End feature modules ───
+
+#[cfg(test)]
+mod rate_limit_test;
 
 pub use access_control::{ROLE_ADMIN, ROLE_ATTESTOR, ROLE_BUSINESS, ROLE_OPERATOR};
 pub use dynamic_fees::{compute_fee, DataKey, FeeConfig};
@@ -137,16 +137,33 @@ pub enum MultiPeriodKey {
 #[contract]
 pub struct AttestationContract;
 
+/// Lexicographic comparison of Soroban strings.
+fn compare_strings(a: &String, b: &String) -> Ordering {
+    let a_len = a.len();
+    let b_len = b.len();
+    let min_len = if a_len < b_len { a_len } else { b_len };
+
+    for i in 0..min_len {
+        let byte_a = a.as_bytes().get(i).unwrap();
+        let byte_b = b.as_bytes().get(i).unwrap();
+        match byte_a.cmp(&byte_b) {
+            Ordering::Equal => continue,
+            other => return other,
+        }
+    }
+    a_len.cmp(&b_len)
+}
+
 #[contractimpl]
 impl AttestationContract {
-    // ── Initialization & Admin (Unchanged from your code) ───────────
-    
-    pub fn initialize(env: Env, admin: Address) {
+    pub fn initialize(env: Env, admin: Address, nonce: u64) {
         if dynamic_fees::is_initialized(&env) {
             panic!("already initialized");
         }
         admin.require_auth();
+        replay_protection::verify_and_increment_nonce(&env, &admin, NONCE_CHANNEL_ADMIN, nonce);
         dynamic_fees::set_admin(&env, &admin);
+        access_control::grant_role(&env, &admin, ROLE_ADMIN);
     }
 
     pub fn configure_fees(env: Env, token: Address, collector: Address, base_fee: i128, enabled: bool) {
@@ -253,377 +270,12 @@ impl AttestationContract {
         access_control::has_role(&env, &account, role)
     }
 
-    /// Get all roles for an address as a bitmap.
-    pub fn get_roles(env: Env, account: Address) -> u32 {
-        access_control::get_roles(&env, &account)
-    }
-
-    /// Get all addresses with any role.
-    pub fn get_role_holders(env: Env) -> Vec<Address> {
-        access_control::get_role_holders(&env)
-    }
-
-    // ── Pause/Unpause ───────────────────────────────────────────────
-
-    /// Pause the contract. Only ADMIN or OPERATOR can pause.
-    pub fn pause(env: Env, caller: Address) {
-        caller.require_auth();
-        let roles = access_control::get_roles(&env, &caller);
-        assert!(
-            (roles & (ROLE_ADMIN | ROLE_OPERATOR)) != 0,
-            "caller must have ADMIN or OPERATOR role"
-        );
-        access_control::set_paused(&env, true);
-        events::emit_paused(&env, &caller);
-    }
-
-    /// Unpause the contract. Only ADMIN can unpause.
-    pub fn unpause(env: Env, caller: Address) {
-        access_control::require_admin(&env, &caller);
-        access_control::set_paused(&env, false);
-        events::emit_unpaused(&env, &caller);
-    }
-
-    /// Check if the contract is paused.
-    pub fn is_paused(env: Env) -> bool {
-        access_control::is_paused(&env)
-    }
-    // ── Legacy Single-Period Attestation (Unchanged) ────────────────
-
-    /// Register a new business. The caller must hold `ROLE_BUSINESS` and
-    /// authorise as their own address.
+    /// Submits a single-period attestation.
     ///
-    /// Creates a record in `Pending` state. Admin must call
-    /// `approve_business` before the business can submit attestations.
-    ///
-    /// Panics if `business` is already registered.
-    pub fn register_business(
-        env: Env,
-        business: Address,
-        name_hash: BytesN<32>,
-        jurisdiction: Symbol,
-        tags: Vec<Symbol>,
-    ) {
-        access_control::require_not_paused(&env);
-        registry::register_business(&env, &business, name_hash, jurisdiction, tags);
-    }
-
-    /// Approve a Pending business → Active. Caller must hold `ROLE_ADMIN`.
-    ///
-    /// Panics if `business` is not in `Pending` state.
-    pub fn approve_business(env: Env, caller: Address, business: Address) {
-        access_control::require_not_paused(&env);
-        registry::approve_business(&env, &caller, &business);
-    }
-
-    /// Suspend an Active business → Suspended. Caller must hold `ROLE_ADMIN`.
-    ///
-    /// `reason` is emitted in the on-chain event for compliance audit trails.
-    /// Panics if `business` is not in `Active` state.
-    pub fn suspend_business(env: Env, caller: Address, business: Address, reason: Symbol) {
-        registry::suspend_business(&env, &caller, &business, reason);
-    }
-
-    /// Reactivate a Suspended business → Active. Caller must hold `ROLE_ADMIN`.
-    ///
-    /// Panics if `business` is not in `Suspended` state.
-    pub fn reactivate_business(env: Env, caller: Address, business: Address) {
-        access_control::require_not_paused(&env);
-        registry::reactivate_business(&env, &caller, &business);
-    }
-
-    /// Replace the tag set on a business record. Caller must hold `ROLE_ADMIN`.
-    ///
-    /// Valid for any lifecycle state. Tags are the KYB/KYC extension hook.
-    pub fn update_business_tags(env: Env, caller: Address, business: Address, tags: Vec<Symbol>) {
-        registry::update_tags(&env, &caller, &business, tags);
-    }
-
-    /// Returns `true` if `business` is registered and `Active`.
-    ///
-    /// This is the attestation gate — called inside `submit_attestation`
-    /// to block Pending and Suspended businesses from submitting.
-    pub fn is_business_active(env: Env, business: Address) -> bool {
-        registry::is_active(&env, &business)
-    }
-
-    /// Return the full business record, or `None` if not registered.
-    pub fn get_business(env: Env, business: Address) -> Option<BusinessRecord> {
-        registry::get_business(&env, &business)
-    }
-
-    /// Return the current business status, or `None` if not registered.
-    pub fn get_business_status(env: Env, business: Address) -> Option<BusinessStatus> {
-        registry::get_status(&env, &business)
-    }
-
-    // ── Core attestation methods ────────────────────────────────────
-
-    /// Submit multiple attestations in a single atomic transaction.
-    ///
-    /// This function provides an efficient way to submit multiple attestations
-    /// for one or more businesses and periods. All attestations in the batch
-    /// are processed atomically: either all succeed or all fail.
-    ///
-    /// # Parameters
-    ///
-    /// * `items` - Vector of `BatchAttestationItem` containing the attestations to submit
-    ///
-    /// # Authorization
-    ///
-    /// For each item, the `business` address must authorize the call, or the caller
-    /// must have the ATTESTOR role. All businesses in the batch must authorize
-    /// before any processing begins.
-    ///
-    /// # Atomicity
-    ///
-    /// The batch operation is atomic:
-    /// - All validations are performed before any state changes
-    /// - If any validation fails, the entire batch is rejected
-    /// - If all validations pass, all attestations are stored, fees are collected,
-    ///   counts are incremented, and events are emitted
-    ///
-    /// # Fee Calculation
-    ///
-    /// Fees are calculated for each attestation based on the business's current
-    /// volume count at the time of calculation. For multiple attestations from
-    /// the same business in one batch, each subsequent attestation will have
-    /// fees calculated based on the incremented count from previous items in
-    /// the batch.
-    ///
-    /// # Panics
-    ///
-    /// Panics if:
-    /// - The contract is paused
-    /// - The batch is empty
-    /// - Any business address fails to authorize
-    /// - Any (business, period) pair already exists
-    /// - Any fee collection fails (insufficient balance, etc.)
-    ///
-    /// # Events
-    ///
-    /// Emits one `AttestationSubmittedEvent` for each successfully processed
-    /// attestation in the batch.
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// let items = vec![
-    ///     BatchAttestationItem {
-    ///         business: business1,
-    ///         period: String::from_str(&env, "2026-01"),
-    ///         merkle_root: root1,
-    ///         timestamp: 1700000000,
-    ///         version: 1,
-    ///     },
-    ///     BatchAttestationItem {
-    ///         business: business1,
-    ///         period: String::from_str(&env, "2026-02"),
-    ///         merkle_root: root2,
-    ///         timestamp: 1700086400,
-    ///         version: 1,
-    ///     },
-    /// ];
-    /// client.submit_attestations_batch(&items);
-    /// ```
-    pub fn submit_attestations_batch(env: Env, items: Vec<BatchAttestationItem>) {
-        // Check contract is not paused
-        access_control::require_not_paused(&env);
-
-        // Validate batch is not empty
-        assert!(!items.is_empty(), "batch cannot be empty");
-
-        let len = items.len();
-
-        // Phase 1: Collect unique businesses and authorize them once
-        // We need to authorize each business only once, even if it appears
-        // multiple times in the batch.
-        let mut authorized_businesses = Vec::new(&env);
-        for i in 0..len {
-            let item = items.get(i).unwrap();
-            // Check if we've already authorized this business
-            let mut already_authorized = false;
-            for j in 0..authorized_businesses.len() {
-                if authorized_businesses.get(j).unwrap() == item.business {
-                    already_authorized = true;
-                    break;
-                }
-            }
-            if !already_authorized {
-                item.business.require_auth();
-                authorized_businesses.push_back(item.business.clone());
-            }
-        }
-
-        // Phase 2: Validate all items before making any state changes (atomic validation)
-        for i in 0..len {
-            let item = items.get(i).unwrap();
-
-            // Check for duplicates within the batch itself
-            for j in (i + 1)..len {
-                let other_item = items.get(j).unwrap();
-                if item.business == other_item.business && item.period == other_item.period {
-                    panic!("duplicate attestation in batch: same business and period at indices {i} and {j}");
-                }
-            }
-
-            // Check for duplicate attestations in storage
-            let key = DataKey::Attestation(item.business.clone(), item.period.clone());
-            if env.storage().instance().has(&key) {
-                panic!("attestation already exists for business and period at index {i}");
-            }
-        }
-
-        // Phase 3: Process all items (all validations passed)
-        for i in 0..len {
-            let item = items.get(i).unwrap();
-
-            // Collect fee (0 if fees disabled or not configured).
-            // Fee is calculated based on current count, which may have been
-            // incremented by previous items in this batch for the same business.
-            let fee_paid = dynamic_fees::collect_fee(&env, &item.business);
-
-            // Track volume for future discount calculations.
-            // This increment affects fee calculation for subsequent items
-            // in the batch from the same business.
-            dynamic_fees::increment_business_count(&env, &item.business);
-
-            // Store attestation data
-            let key = DataKey::Attestation(item.business.clone(), item.period.clone());
-            let data = (
-                item.merkle_root.clone(),
-                item.timestamp,
-                item.version,
-                fee_paid,
-                item.expiry_timestamp,
-            );
-            env.storage().instance().set(&key, &data);
-
-            // Emit event for this attestation
-            events::emit_attestation_submitted(
-                &env,
-                &item.business,
-                &item.period,
-                &item.merkle_root,
-                item.timestamp,
-                item.version,
-                fee_paid,
-            );
-        }
-    }
-
-    /// Submit multiple attestations in a single atomic transaction as an attestor.
-    ///
-    /// The caller must hold `ROLE_ATTESTOR` and meet the minimum stake requirement
-    /// in the configured attestor staking contract.
-    pub fn submit_batch_as_attestor(
-        env: Env,
-        attestor: Address,
-        items: Vec<BatchAttestationItem>,
-    ) {
-        access_control::require_not_paused(&env);
-        access_control::require_attestor(&env, &attestor);
-
-        let staking_contract: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::AttestorStakingContract)
-            .expect("attestor staking contract not configured");
-        let staking_client = AttestorStakingContractClient::new(&env, &staking_contract);
-        assert!(
-            staking_client.is_eligible(&attestor),
-            "attestor does not meet minimum stake"
-        );
-
-        assert!(!items.is_empty(), "batch cannot be empty");
-        let len = items.len();
-
-        // Phase 1: Validate all items before making any state changes (atomic validation)
-        for i in 0..len {
-            let item = items.get(i).unwrap();
-
-            // Registry gate: if the business is registered, it must be Active.
-            if registry::get_business(&env, &item.business).is_some() {
-                assert!(
-                    registry::is_active(&env, &item.business),
-                    "business is not active in the registry"
-                );
-            }
-
-            rate_limit::check_rate_limit(&env, &item.business);
-
-            // Check for duplicates within the batch itself
-            for j in (i + 1)..len {
-                let other_item = items.get(j).unwrap();
-                if item.business == other_item.business && item.period == other_item.period {
-                    panic!("duplicate attestation in batch: same business and period at indices {i} and {j}");
-                }
-            }
-
-            // Check for duplicate attestations in storage
-            let key = DataKey::Attestation(item.business.clone(), item.period.clone());
-            if env.storage().instance().has(&key) {
-                panic!("attestation already exists for business and period at index {i}");
-            }
-        }
-
-        // Phase 2: Process all items (all validations passed)
-        for i in 0..len {
-            let item = items.get(i).unwrap();
-
-            let fee_paid = dynamic_fees::collect_fee_from(&env, &attestor, &item.business);
-            dynamic_fees::increment_business_count(&env, &item.business);
-
-            let key = DataKey::Attestation(item.business.clone(), item.period.clone());
-            let data = (
-                item.merkle_root.clone(),
-                item.timestamp,
-                item.version,
-                fee_paid,
-                item.expiry_timestamp,
-            );
-            env.storage().instance().set(&key, &data);
-            let status_key = (STATUS_KEY_TAG, item.business.clone(), item.period.clone());
-            env.storage().instance().set(&status_key, &STATUS_ACTIVE);
-
-            rate_limit::record_submission(&env, &item.business);
-
-            events::emit_attestation_submitted(
-                &env,
-                &item.business,
-                &item.period,
-                &item.merkle_root,
-                item.timestamp,
-                item.version,
-                fee_paid,
-            );
-        }
-    }
-
-    /// Submit a revenue attestation.
-    ///
-    /// Stores the Merkle root, timestamp, and version for the given
-    /// (business, period) pair. If fees are enabled the caller pays the
-    /// calculated fee (base fee adjusted by tier and volume discounts)
-    /// in the configured token.
-    ///
-    /// An optional `proof_hash` (SHA-256, 32 bytes) may be provided to
-    /// link this attestation to a full off-chain revenue dataset or
-    /// proof bundle. The hash is content-addressable and must not reveal
-    /// sensitive information beyond acting as a pointer.
-    ///
-    /// The business address must authorize the call, or the caller must
-    /// have ATTESTOR role.
-    ///
-    /// # Expiry Semantics
-    /// * `expiry_timestamp` – Optional Unix timestamp (seconds) after which
-    ///   the attestation is considered stale. Pass `None` for no expiry.
-    /// * Expired attestations remain queryable but `is_expired()` returns true.
-    /// * Lenders and counterparties should check expiry before trusting data.
-    ///
-    /// Panics if:
-    /// - The contract is paused
-    /// - An attestation already exists for the same (business, period)
+    /// Expiry enforcement:
+    /// - `expiry_timestamp`, when set, must be strictly greater than both `timestamp`
+    ///   and the current ledger timestamp.
+    /// - Expired-on-arrival attestations are rejected.
     pub fn submit_attestation(
         env: Env,
         business: Address,
@@ -633,13 +285,18 @@ impl AttestationContract {
         version: u32,
         proof_hash: Option<BytesN<32>>,
         expiry_timestamp: Option<u64>,
+        nonce: u64,
     ) {
+        access_control::require_not_paused(&env);
         business.require_auth();
+        replay_protection::verify_and_increment_nonce(&env, &business, NONCE_CHANNEL_BUSINESS, nonce);
+        rate_limit::check_rate_limit(&env, &business);
 
-        let key = DataKey::Attestation(business.clone(), period);
+        let key = DataKey::Attestation(business.clone(), period.clone());
         if env.storage().instance().has(&key) {
             panic!("attestation already exists for this business and period");
         }
+        Self::validate_expiry(&env, timestamp, expiry_timestamp);
 
         // Collect fees.
         let dynamic_fee = dynamic_fees::collect_fee(&env, &business);
@@ -673,6 +330,8 @@ impl AttestationContract {
             expiry_timestamp,
             total_fee,
         );
+
+        rate_limit::record_submission(&env, &business);
     }
 
     /// Submit a revenue attestation as an attestor.
@@ -692,57 +351,123 @@ impl AttestationContract {
         access_control::require_not_paused(&env);
         access_control::require_attestor(&env, &attestor);
 
-        let staking_contract: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::AttestorStakingContract)
-            .expect("attestor staking contract not configured");
-        let staking_client = AttestorStakingContractClient::new(&env, &staking_contract);
-        assert!(
-            staking_client.is_eligible(&attestor),
-            "attestor does not meet minimum stake"
-        );
-
-        // Registry gate: if the business is registered, it must be Active.
-        // Unregistered addresses are still allowed (backward-compatible).
-        if registry::get_business(&env, &business).is_some() {
-            assert!(
-                registry::is_active(&env, &business),
-                "business is not active in the registry"
-            );
+    /// Returns true when an attestation exists and has passed its expiry timestamp.
+    ///
+    /// If the attestation has no expiry or does not exist, returns false.
+    pub fn is_expired(env: Env, business: Address, period: String) -> bool {
+        if let Some(data) = Self::get_attestation(env.clone(), business, period) {
+            return Self::attestation_expired(&env, &data);
         }
-        rate_limit::check_rate_limit(&env, &business);
+        false
+    }
 
-        let key = DataKey::Attestation(business.clone(), period.clone());
-        if env.storage().instance().has(&key) {
-            panic!("attestation already exists for this business and period");
+    /// Verifies attestation integrity and freshness for downstream consumers.
+    ///
+    /// Returns true only when:
+    /// - the attestation exists,
+    /// - the attestation is not revoked,
+    /// - the attestation is not expired, and
+    /// - the stored Merkle root matches `merkle_root`.
+    pub fn verify_attestation(
+        env: Env,
+        business: Address,
+        period: String,
+        merkle_root: BytesN<32>,
+    ) -> bool {
+        if let Some(data) = Self::get_attestation(env.clone(), business.clone(), period.clone()) {
+            if Self::attestation_expired(&env, &data) {
+                return false;
+            }
+            if Self::is_revoked(env, business, period) {
+                return false;
+            }
+            return data.0 == merkle_root;
         }
+        false
+    }
 
-        let fee_paid = dynamic_fees::collect_fee_from(&env, &attestor, &business);
-        dynamic_fees::increment_business_count(&env, &business);
+    pub fn is_revoked(env: Env, business: Address, period: String) -> bool {
+        dispute::is_attestation_revoked(&env, &business, &period)
+    }
 
-        let data = (
-            merkle_root.clone(),
-            timestamp,
-            version,
-            fee_paid,
-            expiry_timestamp,
-        );
-        env.storage().instance().set(&key, &data);
-        let status_key = (STATUS_KEY_TAG, business.clone(), period.clone());
-        env.storage().instance().set(&status_key, &STATUS_ACTIVE);
+    /// Returns revocation metadata for an attestation, if it has been revoked.
+    pub fn get_revocation_info(
+        env: Env,
+        business: Address,
+        period: String,
+    ) -> Option<RevocationData> {
+        dispute::get_attestation_revocation(&env, &business, &period)
+    }
 
-        rate_limit::record_submission(&env, &business);
+    /// Returns attestation data together with optional revocation metadata.
+    pub fn get_attestation_with_status(
+        env: Env,
+        business: Address,
+        period: String,
+    ) -> Option<AttestationWithRevocation> {
+        let attestation = Self::get_attestation(env.clone(), business.clone(), period.clone())?;
+        let revocation = Self::get_revocation_info(env, business, period);
+        Some((attestation, revocation))
+    }
 
-        events::emit_attestation_submitted(
-            &env,
-            &business,
-            &period,
-            &merkle_root,
-            timestamp,
-            version,
-            fee_paid,
-        );
+    /// Verifies an attestation against the expected root and revocation status.
+    pub fn verify_attestation(
+        env: Env,
+        business: Address,
+        period: String,
+        merkle_root: BytesN<32>,
+    ) -> bool {
+        match Self::get_attestation(env.clone(), business.clone(), period.clone()) {
+            Some((stored_root, _, _, _, _, _)) => {
+                stored_root == merkle_root && !Self::is_revoked(env, business, period)
+            }
+            None => false,
+        }
+    }
+
+    /// Batch-queries attestation and revocation state for the requested periods.
+    pub fn get_business_attestations(
+        env: Env,
+        business: Address,
+        periods: Vec<String>,
+    ) -> AttestationStatusResult {
+        let mut results = Vec::new(&env);
+        for period in periods.iter() {
+            let attestation = Self::get_attestation(env.clone(), business.clone(), period.clone());
+            let revocation = Self::get_revocation_info(env.clone(), business.clone(), period.clone());
+            results.push_back((period, attestation, revocation));
+        }
+        results
+    }
+
+    /// Verify that an attestation exists and matches the provided merkle root.
+    /// This does NOT check expiry - use is_expired() separately for that.
+    pub fn verify_attestation(
+        env: Env,
+        business: Address,
+        period: String,
+        merkle_root: BytesN<32>,
+    ) -> bool {
+        if let Some((stored_root, _, _, _, _, _)) = Self::get_attestation(env, business, period) {
+            stored_root == merkle_root
+        } else {
+            false
+        }
+    }
+
+    pub fn revoke_attestation(
+        env: Env,
+        caller: Address,
+        business: Address,
+        period: String,
+        reason: String,
+        _nonce: u64,
+    ) {
+        dispute::require_revocation_authorized(&env, &caller, &business, &period);
+        let revoked_at = env.ledger().timestamp();
+        let revocation = (caller.clone(), revoked_at, reason.clone());
+        dispute::store_attestation_revocation(&env, &business, &period, &revocation);
+        events::emit_attestation_revoked(&env, &business, &period, &caller, &reason);
     }
 
     /// Submit a revenue attestation with extended metadata (currency and net/gross).
@@ -762,14 +487,14 @@ impl AttestationContract {
         is_net: bool,
         nonce: u64,
     ) {
-        access_control::require_not_paused(&env);
-        business.require_auth();
-        replay_protection::verify_and_increment_nonce(
-            &env,
-            &business,
-            NONCE_CHANNEL_BUSINESS,
-            nonce,
-        );
+        access_control::require_admin(&env, &caller);
+        dispute::require_not_revoked_for_update(&env, &business, &period);
+        let key = DataKey::Attestation(business.clone(), period.clone());
+        let (old_root, ts, old_ver, fee, proof_hash, expiry): AttestationData = env
+            .storage()
+            .instance()
+            .get(&key)
+            .expect("not found");
 
         let key = DataKey::Attestation(business.clone(), period.clone());
         if env.storage().instance().has(&key) {
@@ -790,28 +515,38 @@ impl AttestationContract {
             expiry_timestamp,
         );
         env.storage().instance().set(&key, &data);
-
-        let metadata = extended_metadata::validate_metadata(&env, &currency_code, is_net);
-        extended_metadata::set_metadata(&env, &business, &period, &metadata);
-
-        events::emit_attestation_submitted(
+        events::emit_attestation_migrated(
             &env,
             &business,
             &period,
-            &merkle_root,
-            timestamp,
-            version,
-            fee_paid,
-            &proof_hash,
-            expiry_timestamp,
+            &old_root,
+            &new_merkle_root,
+            old_ver,
+            new_version,
+            &caller,
         );
-        let data = (merkle_root, timestamp, version, fee_paid);
-        env.storage().instance().set(&key, &data);
     }
 
-    pub fn get_attestation(env: Env, business: Address, period: String) -> Option<(BytesN<32>, u64, u32, i128)> {
-        let key = DataKey::Attestation(business, period);
-        env.storage().instance().get(&key)
+    /// Pauses state-changing administrative flows.
+    pub fn pause(env: Env, caller: Address) {
+        caller.require_auth();
+        let caller_is_admin = caller == dynamic_fees::get_admin(&env)
+            || access_control::has_role(&env, &caller, ROLE_ADMIN)
+            || access_control::has_role(&env, &caller, ROLE_OPERATOR);
+        assert!(caller_is_admin, "caller must have ADMIN or OPERATOR role");
+        access_control::set_paused(&env, true);
+        events::emit_paused(&env, &caller);
+    }
+
+    /// Restores state-changing administrative flows.
+    pub fn unpause(env: Env, caller: Address) {
+        caller.require_auth();
+        let caller_is_admin = caller == dynamic_fees::get_admin(&env)
+            || access_control::has_role(&env, &caller, ROLE_ADMIN)
+            || access_control::has_role(&env, &caller, ROLE_OPERATOR);
+        assert!(caller_is_admin, "caller must have ADMIN or OPERATOR role");
+        access_control::set_paused(&env, false);
+        events::emit_unpaused(&env, &caller);
     }
 
         // Keep status key in sync for pagination/filtering.
@@ -1206,12 +941,14 @@ impl AttestationContract {
         timelock_ledgers: u32,
         confirmation_window_ledgers: u32,
         cooldown_ledgers: u32,
+        grace_period_ledgers: u32,
     ) {
         dynamic_fees::require_admin(&env);
         let config = veritasor_common::key_rotation::RotationConfig {
             timelock_ledgers,
             confirmation_window_ledgers,
             cooldown_ledgers,
+            grace_period_ledgers,
         };
         veritasor_common::key_rotation::set_rotation_config(&env, &config);
     }
@@ -1474,14 +1211,66 @@ impl AttestationContract {
         get_dispute_ids_by_attestation(&env, &business, &period)
     }
 
-    /// Get all dispute IDs opened by a specific challenger.
-    pub fn get_disputes_by_challenger(env: Env, challenger: Address) -> Vec<u64> {
-        get_dispute_ids_by_challenger(&env, &challenger)
+    /// Configure the sliding-window and burst-window rate limit controls.
+    pub fn configure_rate_limit(
+        env: Env,
+        max_submissions: u32,
+        window_seconds: u64,
+        burst_max_submissions: u32,
+        burst_window_seconds: u64,
+        enabled: bool,
+        nonce: u64,
+    ) {
+        let admin = dynamic_fees::require_admin(&env);
+        replay_protection::verify_and_increment_nonce(&env, &admin, NONCE_CHANNEL_ADMIN, nonce);
+
+        let config = RateLimitConfig {
+            max_submissions,
+            window_seconds,
+            burst_max_submissions,
+            burst_window_seconds,
+            enabled,
+        };
+        rate_limit::set_rate_limit_config(&env, &config);
+        events::emit_rate_limit_config_changed(
+            &env,
+            max_submissions,
+            window_seconds,
+            burst_max_submissions,
+            burst_window_seconds,
+            enabled,
+            &admin,
+        );
+    }
+
+    /// Return the currently configured rate limit, if any.
+    pub fn get_rate_limit_config(env: Env) -> Option<RateLimitConfig> {
+        rate_limit::get_rate_limit_config(&env)
+    }
+
+    /// Return the active submission count for the business in the full window.
+    pub fn get_submission_window_count(env: Env, business: Address) -> u32 {
+        rate_limit::get_submission_count(&env, &business)
+    }
+
+    /// Return the active submission count for the business in the burst window.
+    pub fn get_submission_burst_count(env: Env, business: Address) -> u32 {
+        rate_limit::get_burst_submission_count(&env, &business)
+    }
+
+    /// Return the cumulative business submission count used by fee logic.
+    pub fn get_business_count(env: Env, business: Address) -> u64 {
+        dynamic_fees::get_business_count(&env, &business)
+    }
+
+    /// Return the next nonce required for the given actor/channel pair.
+    pub fn get_replay_nonce(env: Env, actor: Address, channel: u32) -> u64 {
+        replay_protection::get_nonce(&env, &actor, channel)
     }
 }
-    pub fn get_fee_config(env: Env) -> Option<FeeConfig> { dynamic_fees::get_fee_config(&env) }
-    pub fn get_fee_quote(env: Env, business: Address) -> i128 { dynamic_fees::calculate_fee(&env, &business) }
-    pub fn get_business_tier(env: Env, business: Address) -> u32 { dynamic_fees::get_business_tier(&env, &business) }
-    pub fn get_business_count(env: Env, business: Address) -> u64 { dynamic_fees::get_business_count(&env, &business) }
-    pub fn get_admin(env: Env) -> Address { dynamic_fees::get_admin(&env) }
-}
+
+#[cfg(test)]
+mod test;
+
+#[cfg(test)]
+mod revocation_test;
