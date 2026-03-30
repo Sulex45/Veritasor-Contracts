@@ -149,6 +149,18 @@ pub enum MultiPeriodKey {
 }
 
 #[contract]
+
+/// A single item in a batch attestation submission.
+#[contracttype]
+pub struct BatchAttestationItem {
+    pub business: Address,
+    pub period: String,
+    pub merkle_root: BytesN<32>,
+    pub timestamp: u64,
+    pub version: u32,
+    pub expiry_timestamp: Option<u64>,
+}
+
 pub struct AttestationContract;
 
 /// Lexicographic comparison of Soroban strings.
@@ -1433,6 +1445,73 @@ impl AttestationContract {
     pub fn get_business_tier(env: Env, business: Address) -> u32 {
         dynamic_fees::get_business_tier(&env, &business)
     }
+
+    /// Submit multiple attestations atomically.
+    ///
+    /// All items are validated before any state changes are applied.
+    /// If any validation fails the entire batch is rejected and no
+    /// storage is mutated (full atomicity).
+    ///
+    /// # Panics
+    /// - `"batch cannot be empty"` — items vector is empty.
+    /// - `"duplicate attestation in batch"` — two items share the same (business, period).
+    /// - `"attestation already exists"` — a (business, period) already exists in storage.
+    pub fn submit_attestations_batch(env: Env, items: Vec<BatchAttestationItem>) {
+        access_control::require_not_paused(&env);
+
+        if items.is_empty() {
+            panic!("batch cannot be empty");
+        }
+
+        // ── Validation phase (zero state changes) ───────────────────
+        let len = items.len();
+        for i in 0..len {
+            let item_i = items.get(i).unwrap();
+            item_i.business.require_auth();
+
+            // Detect in-batch duplicates (O(n²) — acceptable for batch sizes).
+            for j in (i + 1)..len {
+                let item_j = items.get(j).unwrap();
+                if item_i.business == item_j.business && item_i.period == item_j.period {
+                    panic!("duplicate attestation in batch");
+                }
+            }
+
+            // Detect conflicts with existing storage.
+            let key = DataKey::Attestation(item_i.business.clone(), item_i.period.clone());
+            if env.storage().instance().has(&key) {
+                panic!("attestation already exists");
+            }
+        }
+
+        // ── Processing phase (state changes) ────────────────────────
+        for i in 0..len {
+            let item = items.get(i).unwrap();
+            let key = DataKey::Attestation(item.business.clone(), item.period.clone());
+
+            let dynamic_fee = dynamic_fees::collect_fee(&env, &item.business);
+            let flat_fee = fees::collect_flat_fee(&env, &item.business);
+            let total_fee = dynamic_fee + flat_fee;
+
+            dynamic_fees::increment_business_count(&env, &item.business);
+
+            let data: AttestationData = (
+                item.merkle_root.clone(),
+                item.timestamp,
+                item.version,
+                total_fee,
+                None,
+                item.expiry_timestamp,
+            );
+            env.storage().instance().set(&key, &data);
+
+            env.events().publish(
+                (Symbol::new(&env, "attestation"), Symbol::new(&env, "submitted")),
+                (item.business.clone(), item.period.clone(), item.merkle_root.clone()),
+            );
+        }
+    }
+
 }
 
 #[cfg(test)]
