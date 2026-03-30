@@ -377,739 +377,483 @@ fn test_spec_document_exists() {
     assert!(method_count > 0, "Spec should define methods");
 }
 
-// =============================================================================
-// Governance Gating Cross-Role Authorization Tests
-//
-// These tests verify the cross-role authorization behavior documented in
-// docs/protocol-dao-governance.md. They ensure governance token gating and
-// role-based permissions are correctly enforced across all governance operations.
-// =============================================================================
+mod governance_gating_tests {
+    use crate::governance_gating::{
+        self, get_direct_voting_power, get_governance_config, get_role_escalation_config,
+        get_role_escalation_power, get_voting_power, has_governance_power,
+        has_role_escalation_power, GovernanceConfig, GovernanceKey, RoleEscalationConfig,
+    };
+    use soroban_sdk::testutils::Address as _;
+    use soroban_sdk::{contract, contractimpl};
+    use soroban_sdk::{token, Address, Env};
 
-mod governance_gating_cross_role_authorization {
-    use soroban_sdk::testutils::{Address as _, Ledger as _};
-    use soroban_sdk::token::StellarAssetClient;
-    use soroban_sdk::{Address, Env};
-    use veritasor_protocol_dao::{ProposalStatus, ProtocolDao, ProtocolDaoClient};
+    #[contract]
+    struct GovernanceHarness;
 
-    const DEFAULT_MIN_VOTES: u32 = 1;
-    const DEFAULT_PROPOSAL_DURATION: u32 = 120_960;
+    #[contractimpl]
+    impl GovernanceHarness {}
 
-    fn setup_dao_with_token(
-        min_votes: u32,
-        proposal_duration: u32,
-    ) -> (Env, ProtocolDaoClient<'static>, Address, Address, Address) {
+    fn with_harness<T>(env: &Env, harness: &Address, f: impl FnOnce() -> T) -> T {
+        env.as_contract(harness, f)
+    }
+
+    fn setup_governance(
+        threshold: i128,
+        enabled: bool,
+    ) -> (Env, Address, Address, Address, Address, Address) {
         let env = Env::default();
         env.mock_all_auths();
 
-        let token_admin = Address::generate(&env);
-        let token_contract = env.register_stellar_asset_contract_v2(token_admin.clone());
-        let token_addr = token_contract.address().clone();
-
+        let harness = env.register(GovernanceHarness, ());
         let admin = Address::generate(&env);
-        let contract_id = env.register(ProtocolDao, ());
-        let client = ProtocolDaoClient::new(&env, &contract_id);
-        client.initialize(
-            &admin,
-            &Some(token_addr.clone()),
-            &min_votes,
-            &proposal_duration,
-        );
+        let alice = Address::generate(&env);
+        let bob = Address::generate(&env);
+        let token_contract = env.register_stellar_asset_contract_v2(admin.clone());
+        let token = token_contract.address().clone();
 
-        (env, client, admin, token_addr, token_admin)
+        with_harness(&env, &harness, || {
+            governance_gating::initialize_governance(&env, &token, threshold, enabled);
+        });
+
+        (env, harness, token, admin, alice, bob)
     }
 
-    fn setup_dao_without_token(
-        min_votes: u32,
-        proposal_duration: u32,
-    ) -> (Env, ProtocolDaoClient<'static>, Address) {
+    fn mint(env: &Env, token: &Address, to: &Address, amount: i128) {
+        token::StellarAssetClient::new(env, token).mint(to, &amount);
+    }
+
+    #[test]
+    fn test_initialize_governance_defaults_role_escalation_controls() {
+        let (env, harness, token, _admin, _alice, _bob) = setup_governance(100, true);
+
+        with_harness(&env, &harness, || {
+            assert_eq!(
+                get_governance_config(&env),
+                Some(GovernanceConfig {
+                    token: token.clone(),
+                    threshold: 100,
+                    enabled: true,
+                })
+            );
+            assert_eq!(
+                get_role_escalation_config(&env),
+                Some(RoleEscalationConfig {
+                    threshold: 100,
+                    allow_delegated_power: false,
+                })
+            );
+            assert!(governance_gating::is_governance_enabled(&env));
+        });
+    }
+
+    #[test]
+    fn test_get_role_escalation_config_returns_none_when_uninitialized() {
+        let env = Env::default();
+        let harness = env.register(GovernanceHarness, ());
+
+        with_harness(&env, &harness, || {
+            assert_eq!(get_governance_config(&env), None);
+            assert_eq!(get_role_escalation_config(&env), None);
+            assert!(!governance_gating::is_governance_enabled(&env));
+        });
+    }
+
+    #[test]
+    fn test_get_governance_config_returns_none_for_partial_legacy_state_without_threshold() {
         let env = Env::default();
         env.mock_all_auths();
 
+        let harness = env.register(GovernanceHarness, ());
         let admin = Address::generate(&env);
-        let contract_id = env.register(ProtocolDao, ());
-        let client = ProtocolDaoClient::new(&env, &contract_id);
-        client.initialize(&admin, &None, &min_votes, &proposal_duration);
+        let token_contract = env.register_stellar_asset_contract_v2(admin.clone());
+        let token = token_contract.address().clone();
 
-        (env, client, admin)
-    }
+        with_harness(&env, &harness, || {
+            env.storage()
+                .instance()
+                .set(&GovernanceKey::GovernanceToken, &token);
+            env.storage()
+                .instance()
+                .set(&GovernanceKey::GovernanceEnabled, &true);
 
-    fn mint_governance_token(env: &Env, token_addr: &Address, to: &Address, amount: i128) {
-        let stellar = StellarAssetClient::new(env, token_addr);
-        stellar.mint(to, &amount);
-    }
-
-    // -------------------------------------------------------------------------
-    // Token Gating: Proposal Creation
-    // -------------------------------------------------------------------------
-
-    #[test]
-    fn gating_token_holder_can_create_fee_config_proposal() {
-        let (env, client, _admin, gov_token, _) = setup_dao_with_token(1, 100);
-        let creator = Address::generate(&env);
-        mint_governance_token(&env, &gov_token, &creator, 1);
-
-        let fee_token = Address::generate(&env);
-        let collector = Address::generate(&env);
-        let proposal_id =
-            client.create_fee_config_proposal(&creator, &fee_token, &collector, &500, &true);
-
-        let proposal = client.get_proposal(&proposal_id).unwrap();
-        assert_eq!(proposal.creator, creator);
-        assert_eq!(proposal.status, ProposalStatus::Pending);
+            assert_eq!(get_governance_config(&env), None);
+            assert_eq!(get_role_escalation_config(&env), None);
+        });
     }
 
     #[test]
-    #[should_panic(expected = "insufficient governance token balance")]
-    fn gating_non_token_holder_cannot_create_fee_config_proposal() {
-        let (env, client, _admin, _gov_token, _) = setup_dao_with_token(1, 100);
-        let non_holder = Address::generate(&env);
+    #[should_panic(expected = "threshold must be non-negative")]
+    fn test_initialize_governance_rejects_negative_threshold() {
+        let env = Env::default();
+        env.mock_all_auths();
 
-        let fee_token = Address::generate(&env);
-        let collector = Address::generate(&env);
-        client.create_fee_config_proposal(&non_holder, &fee_token, &collector, &500, &true);
+        let harness = env.register(GovernanceHarness, ());
+        let admin = Address::generate(&env);
+        let token_contract = env.register_stellar_asset_contract_v2(admin.clone());
+        let token = token_contract.address().clone();
+
+        with_harness(&env, &harness, || {
+            governance_gating::initialize_governance(&env, &token, -1, true);
+        });
     }
 
     #[test]
-    fn gating_token_holder_can_create_fee_toggle_proposal() {
-        let (env, client, _admin, gov_token, _) = setup_dao_with_token(1, 100);
-        let creator = Address::generate(&env);
-        mint_governance_token(&env, &gov_token, &creator, 1);
-
-        let proposal_id = client.create_fee_toggle_proposal(&creator, &false);
-
-        let proposal = client.get_proposal(&proposal_id).unwrap();
-        assert_eq!(proposal.creator, creator);
-        assert_eq!(proposal.status, ProposalStatus::Pending);
+    #[should_panic(expected = "governance already initialized")]
+    fn test_initialize_governance_rejects_reinitialization() {
+        let (env, harness, token, _admin, _alice, _bob) = setup_governance(100, true);
+        with_harness(&env, &harness, || {
+            governance_gating::initialize_governance(&env, &token, 100, true);
+        });
     }
 
     #[test]
-    #[should_panic(expected = "insufficient governance token balance")]
-    fn gating_non_token_holder_cannot_create_fee_toggle_proposal() {
-        let (env, client, _admin, _gov_token, _) = setup_dao_with_token(1, 100);
-        let non_holder = Address::generate(&env);
-        client.create_fee_toggle_proposal(&non_holder, &true);
+    fn test_set_governance_threshold_bumps_role_escalation_floor() {
+        let (env, harness, _token, _admin, _alice, _bob) = setup_governance(100, true);
+
+        with_harness(&env, &harness, || {
+            governance_gating::set_role_escalation_threshold(&env, 150);
+            governance_gating::set_governance_threshold(&env, 200);
+
+            assert_eq!(get_governance_config(&env).unwrap().threshold, 200);
+            assert_eq!(get_role_escalation_config(&env).unwrap().threshold, 200);
+        });
     }
 
     #[test]
-    fn gating_token_holder_can_create_gov_config_proposal() {
-        let (env, client, _admin, gov_token, _) = setup_dao_with_token(1, 100);
-        let creator = Address::generate(&env);
-        mint_governance_token(&env, &gov_token, &creator, 1);
+    fn test_set_governance_threshold_preserves_higher_role_escalation_threshold() {
+        let (env, harness, _token, _admin, _alice, _bob) = setup_governance(100, true);
 
-        let proposal_id = client.create_gov_config_proposal(&creator, &5, &200);
+        with_harness(&env, &harness, || {
+            governance_gating::set_role_escalation_threshold(&env, 175);
+            governance_gating::set_governance_threshold(&env, 120);
 
-        let proposal = client.get_proposal(&proposal_id).unwrap();
-        assert_eq!(proposal.creator, creator);
-        assert_eq!(proposal.status, ProposalStatus::Pending);
+            assert_eq!(get_governance_config(&env).unwrap().threshold, 120);
+            assert_eq!(get_role_escalation_config(&env).unwrap().threshold, 175);
+        });
     }
 
     #[test]
-    #[should_panic(expected = "insufficient governance token balance")]
-    fn gating_non_token_holder_cannot_create_gov_config_proposal() {
-        let (env, client, _admin, _gov_token, _) = setup_dao_with_token(1, 100);
-        let non_holder = Address::generate(&env);
-        client.create_gov_config_proposal(&non_holder, &5, &200);
-    }
-
-    // -------------------------------------------------------------------------
-    // Token Gating: Voting
-    // -------------------------------------------------------------------------
-
-    #[test]
-    fn gating_token_holder_can_vote_for_proposal() {
-        let (env, client, _admin, gov_token, _) = setup_dao_with_token(1, 100);
-        let creator = Address::generate(&env);
-        let voter = Address::generate(&env);
-        mint_governance_token(&env, &gov_token, &creator, 1);
-        mint_governance_token(&env, &gov_token, &voter, 1);
-
-        let fee_token = Address::generate(&env);
-        let collector = Address::generate(&env);
-        let proposal_id =
-            client.create_fee_config_proposal(&creator, &fee_token, &collector, &500, &true);
-
-        client.vote_for(&voter, &proposal_id);
-
-        assert_eq!(client.get_votes_for(&proposal_id), 1);
+    #[should_panic(expected = "threshold must be non-negative")]
+    fn test_set_governance_threshold_rejects_negative_value() {
+        let (env, harness, _token, _admin, _alice, _bob) = setup_governance(100, true);
+        with_harness(&env, &harness, || {
+            governance_gating::set_governance_threshold(&env, -1);
+        });
     }
 
     #[test]
-    #[should_panic(expected = "insufficient governance token balance")]
-    fn gating_non_token_holder_cannot_vote_for_proposal() {
-        let (env, client, _admin, gov_token, _) = setup_dao_with_token(1, 100);
-        let creator = Address::generate(&env);
-        let non_holder = Address::generate(&env);
-        mint_governance_token(&env, &gov_token, &creator, 1);
-
-        let fee_token = Address::generate(&env);
-        let collector = Address::generate(&env);
-        let proposal_id =
-            client.create_fee_config_proposal(&creator, &fee_token, &collector, &500, &true);
-
-        client.vote_for(&non_holder, &proposal_id);
+    #[should_panic(expected = "threshold must be non-negative")]
+    fn test_set_role_escalation_threshold_rejects_negative_value() {
+        let (env, harness, _token, _admin, _alice, _bob) = setup_governance(100, true);
+        with_harness(&env, &harness, || {
+            governance_gating::set_role_escalation_threshold(&env, -1);
+        });
     }
 
     #[test]
-    fn gating_token_holder_can_vote_against_proposal() {
-        let (env, client, _admin, gov_token, _) = setup_dao_with_token(1, 100);
-        let creator = Address::generate(&env);
-        let voter = Address::generate(&env);
-        mint_governance_token(&env, &gov_token, &creator, 1);
-        mint_governance_token(&env, &gov_token, &voter, 1);
-
-        let fee_token = Address::generate(&env);
-        let collector = Address::generate(&env);
-        let proposal_id =
-            client.create_fee_config_proposal(&creator, &fee_token, &collector, &500, &true);
-
-        client.vote_against(&voter, &proposal_id);
-
-        assert_eq!(client.get_votes_against(&proposal_id), 1);
+    #[should_panic(expected = "role escalation threshold must be >= governance threshold")]
+    fn test_set_role_escalation_threshold_rejects_lower_value_than_base_governance() {
+        let (env, harness, _token, _admin, _alice, _bob) = setup_governance(100, true);
+        with_harness(&env, &harness, || {
+            governance_gating::set_role_escalation_threshold(&env, 99);
+        });
     }
 
     #[test]
-    #[should_panic(expected = "insufficient governance token balance")]
-    fn gating_non_token_holder_cannot_vote_against_proposal() {
-        let (env, client, _admin, gov_token, _) = setup_dao_with_token(1, 100);
-        let creator = Address::generate(&env);
-        let non_holder = Address::generate(&env);
-        mint_governance_token(&env, &gov_token, &creator, 1);
-
-        let fee_token = Address::generate(&env);
-        let collector = Address::generate(&env);
-        let proposal_id =
-            client.create_fee_config_proposal(&creator, &fee_token, &collector, &500, &true);
-
-        client.vote_against(&non_holder, &proposal_id);
-    }
-
-    // -------------------------------------------------------------------------
-    // No Token Configured: Permissionless Operations
-    // -------------------------------------------------------------------------
-
-    #[test]
-    fn no_token_anyone_can_create_proposal() {
-        let (env, client, _admin) = setup_dao_without_token(1, 100);
-        let anyone = Address::generate(&env);
-
-        let fee_token = Address::generate(&env);
-        let collector = Address::generate(&env);
-        let proposal_id =
-            client.create_fee_config_proposal(&anyone, &fee_token, &collector, &500, &true);
-
-        let proposal = client.get_proposal(&proposal_id).unwrap();
-        assert_eq!(proposal.creator, anyone);
+    #[should_panic(expected = "governance not initialized")]
+    fn test_set_role_escalation_use_delegated_power_requires_initialization() {
+        let env = Env::default();
+        let harness = env.register(GovernanceHarness, ());
+        with_harness(&env, &harness, || {
+            governance_gating::set_role_escalation_use_delegated_power(&env, true);
+        });
     }
 
     #[test]
-    fn no_token_anyone_can_vote() {
-        let (env, client, _admin) = setup_dao_without_token(1, 100);
-        let creator = Address::generate(&env);
-        let voter = Address::generate(&env);
+    fn test_set_governance_enabled_toggles_enabled_flag() {
+        let (env, harness, _token, _admin, alice, _bob) = setup_governance(100, true);
 
-        let fee_token = Address::generate(&env);
-        let collector = Address::generate(&env);
-        let proposal_id =
-            client.create_fee_config_proposal(&creator, &fee_token, &collector, &500, &true);
+        with_harness(&env, &harness, || {
+            assert!(governance_gating::is_governance_enabled(&env));
+            governance_gating::set_governance_enabled(&env, false);
 
-        client.vote_for(&voter, &proposal_id);
+            assert!(!governance_gating::is_governance_enabled(&env));
+            assert!(!has_governance_power(&env, &alice));
 
-        assert_eq!(client.get_votes_for(&proposal_id), 1);
-    }
-
-    // -------------------------------------------------------------------------
-    // Cross-Role: Admin Operations
-    // -------------------------------------------------------------------------
-
-    #[test]
-    fn cross_role_admin_can_set_governance_token() {
-        let (env, client, admin, _gov_token, _) = setup_dao_with_token(1, 100);
-        let new_token = Address::generate(&env);
-
-        client.set_governance_token(&admin, &new_token);
-
-        let (_, stored_token, _, _) = client.get_config();
-        assert_eq!(stored_token, Some(new_token));
+            governance_gating::set_governance_enabled(&env, true);
+            assert!(governance_gating::is_governance_enabled(&env));
+        });
     }
 
     #[test]
-    #[should_panic(expected = "caller is not admin")]
-    fn cross_role_non_admin_cannot_set_governance_token() {
-        let (env, client, _admin, gov_token, _) = setup_dao_with_token(1, 100);
-        let token_holder = Address::generate(&env);
-        mint_governance_token(&env, &gov_token, &token_holder, 100);
+    fn test_get_direct_and_total_voting_power_return_zero_when_governance_uninitialized() {
+        let env = Env::default();
+        let harness = env.register(GovernanceHarness, ());
+        let alice = Address::generate(&env);
 
-        let new_token = Address::generate(&env);
-        client.set_governance_token(&token_holder, &new_token);
+        with_harness(&env, &harness, || {
+            assert_eq!(get_direct_voting_power(&env, &alice), 0);
+            assert_eq!(get_voting_power(&env, &alice), 0);
+            assert_eq!(get_role_escalation_power(&env, &alice), 0);
+        });
     }
 
     #[test]
-    fn cross_role_admin_can_set_voting_config() {
-        let (_, client, admin, _, _) = setup_dao_with_token(1, 100);
+    fn test_delegate_voting_power_transfers_power_without_duplication() {
+        let (env, harness, token, _admin, alice, bob) = setup_governance(100, true);
+        mint(&env, &token, &alice, 100);
+        mint(&env, &token, &bob, 50);
 
-        client.set_voting_config(&admin, &10, &500);
+        with_harness(&env, &harness, || {
+            assert_eq!(get_direct_voting_power(&env, &alice), 100);
+            assert_eq!(get_voting_power(&env, &alice), 100);
+            assert_eq!(get_voting_power(&env, &bob), 50);
 
-        let (_, _, min_votes, duration) = client.get_config();
-        assert_eq!(min_votes, 10);
-        assert_eq!(duration, 500);
+            governance_gating::delegate_voting_power(&env, &alice, &bob);
+
+            assert_eq!(
+                governance_gating::get_delegate(&env, &alice),
+                Some(bob.clone())
+            );
+            assert_eq!(get_voting_power(&env, &alice), 0);
+            assert_eq!(get_voting_power(&env, &bob), 150);
+            assert!(!has_governance_power(&env, &alice));
+            assert!(has_governance_power(&env, &bob));
+        });
     }
 
     #[test]
-    #[should_panic(expected = "caller is not admin")]
-    fn cross_role_non_admin_cannot_set_voting_config() {
-        let (env, client, _admin, gov_token, _) = setup_dao_with_token(1, 100);
-        let token_holder = Address::generate(&env);
-        mint_governance_token(&env, &gov_token, &token_holder, 100);
+    #[should_panic(expected = "governance not initialized")]
+    fn test_delegate_voting_power_requires_initialization() {
+        let env = Env::default();
+        env.mock_all_auths();
 
-        client.set_voting_config(&token_holder, &10, &500);
-    }
+        let harness = env.register(GovernanceHarness, ());
+        let alice = Address::generate(&env);
+        let bob = Address::generate(&env);
 
-    // -------------------------------------------------------------------------
-    // Cross-Role: Cancel Authorization
-    // -------------------------------------------------------------------------
-
-    #[test]
-    fn cross_role_creator_can_cancel_own_proposal() {
-        let (env, client, _admin, gov_token, _) = setup_dao_with_token(1, 100);
-        let creator = Address::generate(&env);
-        mint_governance_token(&env, &gov_token, &creator, 1);
-
-        let fee_token = Address::generate(&env);
-        let collector = Address::generate(&env);
-        let proposal_id =
-            client.create_fee_config_proposal(&creator, &fee_token, &collector, &500, &true);
-
-        client.cancel_proposal(&creator, &proposal_id);
-
-        let proposal = client.get_proposal(&proposal_id).unwrap();
-        assert_eq!(proposal.status, ProposalStatus::Rejected);
+        with_harness(&env, &harness, || {
+            governance_gating::delegate_voting_power(&env, &alice, &bob);
+        });
     }
 
     #[test]
-    fn cross_role_admin_can_cancel_any_proposal() {
-        let (env, client, admin, gov_token, _) = setup_dao_with_token(1, 100);
-        let creator = Address::generate(&env);
-        mint_governance_token(&env, &gov_token, &creator, 1);
-
-        let fee_token = Address::generate(&env);
-        let collector = Address::generate(&env);
-        let proposal_id =
-            client.create_fee_config_proposal(&creator, &fee_token, &collector, &500, &true);
-
-        client.cancel_proposal(&admin, &proposal_id);
-
-        let proposal = client.get_proposal(&proposal_id).unwrap();
-        assert_eq!(proposal.status, ProposalStatus::Rejected);
+    #[should_panic(expected = "cannot delegate to self")]
+    fn test_delegate_voting_power_rejects_self_delegation() {
+        let (env, harness, token, _admin, alice, _bob) = setup_governance(100, true);
+        mint(&env, &token, &alice, 100);
+        with_harness(&env, &harness, || {
+            governance_gating::delegate_voting_power(&env, &alice, &alice);
+        });
     }
 
     #[test]
-    #[should_panic(expected = "only creator or admin can cancel")]
-    fn cross_role_other_token_holder_cannot_cancel_proposal() {
-        let (env, client, _admin, gov_token, _) = setup_dao_with_token(1, 100);
-        let creator = Address::generate(&env);
-        let other_holder = Address::generate(&env);
-        mint_governance_token(&env, &gov_token, &creator, 1);
-        mint_governance_token(&env, &gov_token, &other_holder, 1);
+    fn test_redelegation_uses_current_balance_and_removes_old_snapshot_from_previous_delegate() {
+        let (env, harness, token, _admin, alice, bob) = setup_governance(100, true);
+        let carol = Address::generate(&env);
+        mint(&env, &token, &alice, 100);
+        mint(&env, &token, &bob, 50);
+        mint(&env, &token, &carol, 25);
 
-        let fee_token = Address::generate(&env);
-        let collector = Address::generate(&env);
-        let proposal_id =
-            client.create_fee_config_proposal(&creator, &fee_token, &collector, &500, &true);
+        with_harness(&env, &harness, || {
+            governance_gating::delegate_voting_power(&env, &alice, &bob);
+        });
+        mint(&env, &token, &alice, 40);
 
-        client.cancel_proposal(&other_holder, &proposal_id);
+        with_harness(&env, &harness, || {
+            governance_gating::delegate_voting_power(&env, &alice, &carol);
+
+            assert_eq!(
+                governance_gating::get_delegate(&env, &alice),
+                Some(carol.clone())
+            );
+            assert_eq!(get_voting_power(&env, &alice), 0);
+            assert_eq!(get_voting_power(&env, &bob), 50);
+            assert_eq!(get_voting_power(&env, &carol), 165);
+        });
     }
 
     #[test]
-    #[should_panic(expected = "only creator or admin can cancel")]
-    fn cross_role_voter_cannot_cancel_proposal() {
-        let (env, client, _admin, gov_token, _) = setup_dao_with_token(2, 100);
-        let creator = Address::generate(&env);
-        let voter = Address::generate(&env);
-        mint_governance_token(&env, &gov_token, &creator, 1);
-        mint_governance_token(&env, &gov_token, &voter, 1);
+    fn test_revoke_delegation_reconciles_snapshotted_power_and_restores_direct_balance() {
+        let (env, harness, token, _admin, alice, bob) = setup_governance(100, true);
+        mint(&env, &token, &alice, 100);
+        mint(&env, &token, &bob, 50);
 
-        let fee_token = Address::generate(&env);
-        let collector = Address::generate(&env);
-        let proposal_id =
-            client.create_fee_config_proposal(&creator, &fee_token, &collector, &500, &true);
+        with_harness(&env, &harness, || {
+            governance_gating::delegate_voting_power(&env, &alice, &bob);
+        });
+        mint(&env, &token, &alice, 25);
+        with_harness(&env, &harness, || {
+            governance_gating::revoke_delegation(&env, &alice);
 
-        client.vote_for(&voter, &proposal_id);
-
-        client.cancel_proposal(&voter, &proposal_id);
-    }
-
-    // -------------------------------------------------------------------------
-    // Cross-Role: Execution
-    // -------------------------------------------------------------------------
-
-    #[test]
-    fn cross_role_any_address_can_execute_approved_proposal() {
-        let (env, client, _admin, gov_token, _) = setup_dao_with_token(1, 100);
-        let creator = Address::generate(&env);
-        let voter = Address::generate(&env);
-        let executor = Address::generate(&env);
-        mint_governance_token(&env, &gov_token, &creator, 1);
-        mint_governance_token(&env, &gov_token, &voter, 1);
-
-        let fee_token = Address::generate(&env);
-        let collector = Address::generate(&env);
-        let proposal_id =
-            client.create_fee_config_proposal(&creator, &fee_token, &collector, &500, &true);
-
-        client.vote_for(&voter, &proposal_id);
-
-        client.execute_proposal(&executor, &proposal_id);
-
-        let proposal = client.get_proposal(&proposal_id).unwrap();
-        assert_eq!(proposal.status, ProposalStatus::Executed);
+            assert_eq!(governance_gating::get_delegate(&env, &alice), None);
+            assert_eq!(get_voting_power(&env, &alice), 125);
+            assert_eq!(get_voting_power(&env, &bob), 50);
+        });
     }
 
     #[test]
-    fn cross_role_non_token_holder_can_execute_approved_proposal() {
-        let (env, client, _admin, gov_token, _) = setup_dao_with_token(1, 100);
-        let creator = Address::generate(&env);
-        let voter = Address::generate(&env);
-        mint_governance_token(&env, &gov_token, &creator, 1);
-        mint_governance_token(&env, &gov_token, &voter, 1);
+    fn test_revoke_delegation_is_noop_when_no_delegate_exists() {
+        let (env, harness, token, _admin, alice, bob) = setup_governance(100, true);
+        mint(&env, &token, &alice, 100);
+        mint(&env, &token, &bob, 50);
 
-        let non_holder_executor = Address::generate(&env);
+        with_harness(&env, &harness, || {
+            governance_gating::revoke_delegation(&env, &alice);
 
-        let fee_token = Address::generate(&env);
-        let collector = Address::generate(&env);
-        let proposal_id =
-            client.create_fee_config_proposal(&creator, &fee_token, &collector, &500, &true);
-
-        client.vote_for(&voter, &proposal_id);
-
-        client.execute_proposal(&non_holder_executor, &proposal_id);
-
-        let proposal = client.get_proposal(&proposal_id).unwrap();
-        assert_eq!(proposal.status, ProposalStatus::Executed);
-    }
-
-    // -------------------------------------------------------------------------
-    // Cross-Role: Double Vote Prevention
-    // -------------------------------------------------------------------------
-
-    #[test]
-    #[should_panic(expected = "already voted")]
-    fn cross_role_same_voter_cannot_vote_twice() {
-        let (env, client, _admin, gov_token, _) = setup_dao_with_token(2, 100);
-        let creator = Address::generate(&env);
-        let voter = Address::generate(&env);
-        mint_governance_token(&env, &gov_token, &creator, 1);
-        mint_governance_token(&env, &gov_token, &voter, 1);
-
-        let fee_token = Address::generate(&env);
-        let collector = Address::generate(&env);
-        let proposal_id =
-            client.create_fee_config_proposal(&creator, &fee_token, &collector, &500, &true);
-
-        client.vote_for(&voter, &proposal_id);
-        client.vote_for(&voter, &proposal_id);
+            assert_eq!(governance_gating::get_delegate(&env, &alice), None);
+            assert_eq!(get_voting_power(&env, &alice), 100);
+            assert_eq!(get_voting_power(&env, &bob), 50);
+        });
     }
 
     #[test]
-    #[should_panic(expected = "already voted")]
-    fn cross_role_voter_cannot_vote_for_then_against() {
-        let (env, client, _admin, gov_token, _) = setup_dao_with_token(2, 100);
-        let creator = Address::generate(&env);
-        let voter = Address::generate(&env);
-        mint_governance_token(&env, &gov_token, &creator, 1);
-        mint_governance_token(&env, &gov_token, &voter, 1);
+    fn test_revoke_delegation_uses_legacy_balance_fallback_when_snapshot_is_missing() {
+        let (env, harness, token, _admin, alice, bob) = setup_governance(100, true);
+        mint(&env, &token, &alice, 80);
+        mint(&env, &token, &bob, 20);
 
-        let fee_token = Address::generate(&env);
-        let collector = Address::generate(&env);
-        let proposal_id =
-            client.create_fee_config_proposal(&creator, &fee_token, &collector, &500, &true);
+        with_harness(&env, &harness, || {
+            env.storage()
+                .instance()
+                .set(&GovernanceKey::Delegation(alice.clone()), &bob);
+            env.storage()
+                .instance()
+                .set(&GovernanceKey::DelegatedPower(bob.clone()), &80i128);
 
-        client.vote_for(&voter, &proposal_id);
-        client.vote_against(&voter, &proposal_id);
-    }
+            governance_gating::revoke_delegation(&env, &alice);
 
-    // -------------------------------------------------------------------------
-    // Cross-Role: Proposal Lifecycle Transitions
-    // -------------------------------------------------------------------------
-
-    #[test]
-    #[should_panic(expected = "proposal is not pending")]
-    fn cross_role_cannot_vote_on_executed_proposal() {
-        let (env, client, _admin, gov_token, _) = setup_dao_with_token(1, 100);
-        let creator = Address::generate(&env);
-        let voter1 = Address::generate(&env);
-        let voter2 = Address::generate(&env);
-        mint_governance_token(&env, &gov_token, &creator, 1);
-        mint_governance_token(&env, &gov_token, &voter1, 1);
-        mint_governance_token(&env, &gov_token, &voter2, 1);
-
-        let fee_token = Address::generate(&env);
-        let collector = Address::generate(&env);
-        let proposal_id =
-            client.create_fee_config_proposal(&creator, &fee_token, &collector, &500, &true);
-
-        client.vote_for(&voter1, &proposal_id);
-        client.execute_proposal(&creator, &proposal_id);
-
-        client.vote_for(&voter2, &proposal_id);
+            assert_eq!(governance_gating::get_delegate(&env, &alice), None);
+            assert_eq!(get_voting_power(&env, &alice), 80);
+            assert_eq!(get_voting_power(&env, &bob), 20);
+        });
     }
 
     #[test]
-    #[should_panic(expected = "proposal is not pending")]
-    fn cross_role_cannot_vote_on_rejected_proposal() {
-        let (env, client, _admin, gov_token, _) = setup_dao_with_token(1, 100);
-        let creator = Address::generate(&env);
-        let voter = Address::generate(&env);
-        mint_governance_token(&env, &gov_token, &creator, 1);
-        mint_governance_token(&env, &gov_token, &voter, 1);
+    fn test_role_escalation_defaults_to_direct_balance_only() {
+        let (env, harness, token, _admin, alice, bob) = setup_governance(50, true);
+        mint(&env, &token, &alice, 100);
+        mint(&env, &token, &bob, 50);
 
-        let fee_token = Address::generate(&env);
-        let collector = Address::generate(&env);
-        let proposal_id =
-            client.create_fee_config_proposal(&creator, &fee_token, &collector, &500, &true);
+        with_harness(&env, &harness, || {
+            governance_gating::set_role_escalation_threshold(&env, 120);
+            governance_gating::delegate_voting_power(&env, &alice, &bob);
 
-        client.cancel_proposal(&creator, &proposal_id);
-
-        client.vote_for(&voter, &proposal_id);
+            assert_eq!(get_role_escalation_power(&env, &bob), 50);
+            assert!(has_governance_power(&env, &bob));
+            assert!(!has_role_escalation_power(&env, &bob));
+        });
     }
 
     #[test]
-    #[should_panic(expected = "proposal is not pending")]
-    fn cross_role_cannot_execute_rejected_proposal() {
-        let (env, client, _admin, gov_token, _) = setup_dao_with_token(1, 100);
-        let creator = Address::generate(&env);
-        let voter = Address::generate(&env);
-        mint_governance_token(&env, &gov_token, &creator, 1);
-        mint_governance_token(&env, &gov_token, &voter, 1);
+    fn test_role_escalation_can_opt_into_delegated_power() {
+        let (env, harness, token, _admin, alice, bob) = setup_governance(50, true);
+        mint(&env, &token, &alice, 100);
+        mint(&env, &token, &bob, 50);
 
-        let fee_token = Address::generate(&env);
-        let collector = Address::generate(&env);
-        let proposal_id =
-            client.create_fee_config_proposal(&creator, &fee_token, &collector, &500, &true);
+        with_harness(&env, &harness, || {
+            governance_gating::set_role_escalation_threshold(&env, 120);
+            governance_gating::delegate_voting_power(&env, &alice, &bob);
+            governance_gating::set_role_escalation_use_delegated_power(&env, true);
 
-        client.vote_for(&voter, &proposal_id);
-        client.cancel_proposal(&creator, &proposal_id);
-
-        client.execute_proposal(&voter, &proposal_id);
+            assert_eq!(get_role_escalation_power(&env, &bob), 150);
+            assert!(has_role_escalation_power(&env, &bob));
+            governance_gating::require_role_escalation_threshold(&env, &bob);
+        });
     }
 
     #[test]
-    #[should_panic(expected = "proposal is not pending")]
-    fn cross_role_cannot_cancel_executed_proposal() {
-        let (env, client, admin, gov_token, _) = setup_dao_with_token(1, 100);
-        let creator = Address::generate(&env);
-        let voter = Address::generate(&env);
-        mint_governance_token(&env, &gov_token, &creator, 1);
-        mint_governance_token(&env, &gov_token, &voter, 1);
+    fn test_has_governance_and_role_escalation_power_fail_closed_when_uninitialized() {
+        let env = Env::default();
+        let harness = env.register(GovernanceHarness, ());
+        let alice = Address::generate(&env);
 
-        let fee_token = Address::generate(&env);
-        let collector = Address::generate(&env);
-        let proposal_id =
-            client.create_fee_config_proposal(&creator, &fee_token, &collector, &500, &true);
-
-        client.vote_for(&voter, &proposal_id);
-        client.execute_proposal(&creator, &proposal_id);
-
-        client.cancel_proposal(&admin, &proposal_id);
+        with_harness(&env, &harness, || {
+            assert!(!has_governance_power(&env, &alice));
+            assert!(!has_role_escalation_power(&env, &alice));
+        });
     }
 
-    // -------------------------------------------------------------------------
-    // Cross-Role: Expiry Behavior
-    // -------------------------------------------------------------------------
+    #[test]
+    fn test_has_governance_power_returns_false_when_disabled() {
+        let (env, harness, token, _admin, alice, _bob) = setup_governance(100, false);
+        mint(&env, &token, &alice, 200);
+
+        with_harness(&env, &harness, || {
+            assert!(!has_governance_power(&env, &alice));
+            assert!(!has_role_escalation_power(&env, &alice));
+        });
+    }
 
     #[test]
-    #[should_panic(expected = "proposal expired")]
-    fn cross_role_cannot_vote_on_expired_proposal() {
-        let (env, client, _admin, gov_token, _) = setup_dao_with_token(1, 5);
-        let creator = Address::generate(&env);
-        let voter = Address::generate(&env);
-        mint_governance_token(&env, &gov_token, &creator, 1);
-        mint_governance_token(&env, &gov_token, &voter, 1);
+    #[should_panic(expected = "governance disabled")]
+    fn test_require_role_escalation_threshold_fails_closed_when_governance_disabled() {
+        let (env, harness, token, _admin, alice, _bob) = setup_governance(100, false);
+        mint(&env, &token, &alice, 200);
 
-        let fee_token = Address::generate(&env);
-        let collector = Address::generate(&env);
-        let proposal_id =
-            client.create_fee_config_proposal(&creator, &fee_token, &collector, &500, &true);
+        with_harness(&env, &harness, || {
+            assert!(!governance_gating::is_governance_enabled(&env));
+            assert!(!has_role_escalation_power(&env, &alice));
+            governance_gating::require_role_escalation_threshold(&env, &alice);
+        });
+    }
 
-        env.ledger().with_mut(|li| {
-            li.sequence_number += 10;
+    #[test]
+    fn test_require_governance_threshold_allows_uninitialized_or_disabled_governance() {
+        let uninitialized_env = Env::default();
+        uninitialized_env.mock_all_auths();
+        let uninitialized_harness = uninitialized_env.register(GovernanceHarness, ());
+        let caller = Address::generate(&uninitialized_env);
+        with_harness(&uninitialized_env, &uninitialized_harness, || {
+            governance_gating::require_governance_threshold(&uninitialized_env, &caller);
         });
 
-        client.vote_for(&voter, &proposal_id);
-    }
-
-    #[test]
-    #[should_panic(expected = "proposal expired")]
-    fn cross_role_cannot_execute_expired_proposal() {
-        let (env, client, _admin, gov_token, _) = setup_dao_with_token(1, 5);
-        let creator = Address::generate(&env);
-        let voter = Address::generate(&env);
-        mint_governance_token(&env, &gov_token, &creator, 1);
-        mint_governance_token(&env, &gov_token, &voter, 1);
-
-        let fee_token = Address::generate(&env);
-        let collector = Address::generate(&env);
-        let proposal_id =
-            client.create_fee_config_proposal(&creator, &fee_token, &collector, &500, &true);
-
-        client.vote_for(&voter, &proposal_id);
-
-        env.ledger().with_mut(|li| {
-            li.sequence_number += 10;
+        let (env, harness, token, _admin, alice, _bob) = setup_governance(100, false);
+        mint(&env, &token, &alice, 10);
+        with_harness(&env, &harness, || {
+            governance_gating::require_governance_threshold(&env, &alice);
         });
-
-        client.execute_proposal(&creator, &proposal_id);
-    }
-
-    // -------------------------------------------------------------------------
-    // Cross-Role: Quorum and Majority Enforcement
-    // -------------------------------------------------------------------------
-
-    #[test]
-    #[should_panic(expected = "quorum not met")]
-    fn cross_role_execution_requires_quorum() {
-        let (env, client, _admin, gov_token, _) = setup_dao_with_token(3, 100);
-        let creator = Address::generate(&env);
-        let voter1 = Address::generate(&env);
-        let voter2 = Address::generate(&env);
-        mint_governance_token(&env, &gov_token, &creator, 1);
-        mint_governance_token(&env, &gov_token, &voter1, 1);
-        mint_governance_token(&env, &gov_token, &voter2, 1);
-
-        let fee_token = Address::generate(&env);
-        let collector = Address::generate(&env);
-        let proposal_id =
-            client.create_fee_config_proposal(&creator, &fee_token, &collector, &500, &true);
-
-        client.vote_for(&voter1, &proposal_id);
-        client.vote_for(&voter2, &proposal_id);
-
-        client.execute_proposal(&creator, &proposal_id);
     }
 
     #[test]
-    #[should_panic(expected = "proposal not approved")]
-    fn cross_role_execution_requires_majority() {
-        let (env, client, _admin, gov_token, _) = setup_dao_with_token(2, 100);
-        let creator = Address::generate(&env);
-        let voter1 = Address::generate(&env);
-        let voter2 = Address::generate(&env);
-        mint_governance_token(&env, &gov_token, &creator, 1);
-        mint_governance_token(&env, &gov_token, &voter1, 1);
-        mint_governance_token(&env, &gov_token, &voter2, 1);
+    #[should_panic(expected = "insufficient governance voting power")]
+    fn test_require_governance_threshold_rejects_insufficient_power_when_enabled() {
+        let (env, harness, token, _admin, alice, _bob) = setup_governance(100, true);
+        mint(&env, &token, &alice, 99);
 
-        let fee_token = Address::generate(&env);
-        let collector = Address::generate(&env);
-        let proposal_id =
-            client.create_fee_config_proposal(&creator, &fee_token, &collector, &500, &true);
-
-        client.vote_for(&voter1, &proposal_id);
-        client.vote_against(&voter2, &proposal_id);
-
-        client.execute_proposal(&creator, &proposal_id);
-    }
-
-    // -------------------------------------------------------------------------
-    // Cross-Role: Multiple Voters and Role Isolation
-    // -------------------------------------------------------------------------
-
-    #[test]
-    fn cross_role_multiple_independent_voters() {
-        let (env, client, _admin, gov_token, _) = setup_dao_with_token(3, 100);
-        let creator = Address::generate(&env);
-        let voter1 = Address::generate(&env);
-        let voter2 = Address::generate(&env);
-        let voter3 = Address::generate(&env);
-        mint_governance_token(&env, &gov_token, &creator, 1);
-        mint_governance_token(&env, &gov_token, &voter1, 1);
-        mint_governance_token(&env, &gov_token, &voter2, 1);
-        mint_governance_token(&env, &gov_token, &voter3, 1);
-
-        let fee_token = Address::generate(&env);
-        let collector = Address::generate(&env);
-        let proposal_id =
-            client.create_fee_config_proposal(&creator, &fee_token, &collector, &500, &true);
-
-        client.vote_for(&voter1, &proposal_id);
-        client.vote_for(&voter2, &proposal_id);
-        client.vote_against(&voter3, &proposal_id);
-
-        assert_eq!(client.get_votes_for(&proposal_id), 2);
-        assert_eq!(client.get_votes_against(&proposal_id), 1);
+        with_harness(&env, &harness, || {
+            governance_gating::require_governance_threshold(&env, &alice);
+        });
     }
 
     #[test]
-    fn cross_role_creator_can_also_vote() {
-        let (env, client, _admin, gov_token, _) = setup_dao_with_token(1, 100);
-        let creator = Address::generate(&env);
-        mint_governance_token(&env, &gov_token, &creator, 1);
+    fn test_legacy_governance_state_falls_back_to_secure_role_escalation_defaults() {
+        let env = Env::default();
+        env.mock_all_auths();
 
-        let fee_token = Address::generate(&env);
-        let collector = Address::generate(&env);
-        let proposal_id =
-            client.create_fee_config_proposal(&creator, &fee_token, &collector, &500, &true);
+        let harness = env.register(GovernanceHarness, ());
+        let admin = Address::generate(&env);
+        let token_contract = env.register_stellar_asset_contract_v2(admin.clone());
+        let token = token_contract.address().clone();
 
-        client.vote_for(&creator, &proposal_id);
+        with_harness(&env, &harness, || {
+            env.storage()
+                .instance()
+                .set(&GovernanceKey::GovernanceToken, &token);
+            env.storage()
+                .instance()
+                .set(&GovernanceKey::GovernanceThreshold, &123i128);
+            env.storage()
+                .instance()
+                .set(&GovernanceKey::GovernanceEnabled, &true);
 
-        assert_eq!(client.get_votes_for(&proposal_id), 1);
-        client.execute_proposal(&creator, &proposal_id);
-
-        let proposal = client.get_proposal(&proposal_id).unwrap();
-        assert_eq!(proposal.status, ProposalStatus::Executed);
-    }
-
-    #[test]
-    fn cross_role_admin_can_also_be_voter_if_token_holder() {
-        let (env, client, admin, gov_token, _) = setup_dao_with_token(1, 100);
-        let creator = Address::generate(&env);
-        mint_governance_token(&env, &gov_token, &creator, 1);
-        mint_governance_token(&env, &gov_token, &admin, 1);
-
-        let fee_token = Address::generate(&env);
-        let collector = Address::generate(&env);
-        let proposal_id =
-            client.create_fee_config_proposal(&creator, &fee_token, &collector, &500, &true);
-
-        client.vote_for(&admin, &proposal_id);
-
-        assert_eq!(client.get_votes_for(&proposal_id), 1);
-    }
-
-    #[test]
-    #[should_panic(expected = "insufficient governance token balance")]
-    fn cross_role_admin_without_token_cannot_vote() {
-        let (env, client, admin, gov_token, _) = setup_dao_with_token(1, 100);
-        let creator = Address::generate(&env);
-        mint_governance_token(&env, &gov_token, &creator, 1);
-
-        let fee_token = Address::generate(&env);
-        let collector = Address::generate(&env);
-        let proposal_id =
-            client.create_fee_config_proposal(&creator, &fee_token, &collector, &500, &true);
-
-        client.vote_for(&admin, &proposal_id);
-    }
-
-    // -------------------------------------------------------------------------
-    // Cross-Role: Config Defaults
-    // -------------------------------------------------------------------------
-
-    #[test]
-    fn cross_role_default_config_applied_when_zero() {
-        let (_, client, admin, _, _) = setup_dao_with_token(0, 0);
-
-        let (stored_admin, _, min_votes, duration) = client.get_config();
-        assert_eq!(stored_admin, admin);
-        assert_eq!(min_votes, DEFAULT_MIN_VOTES);
-        assert_eq!(duration, DEFAULT_PROPOSAL_DURATION);
-    }
-
-    #[test]
-    fn cross_role_custom_config_applied() {
-        let (_, client, admin, _, _) = setup_dao_with_token(5, 1000);
-
-        let (stored_admin, _, min_votes, duration) = client.get_config();
-        assert_eq!(stored_admin, admin);
-        assert_eq!(min_votes, 5);
-        assert_eq!(duration, 1000);
+            assert_eq!(
+                get_role_escalation_config(&env),
+                Some(RoleEscalationConfig {
+                    threshold: 123,
+                    allow_delegated_power: false,
+                })
+            );
+        });
     }
 }

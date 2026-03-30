@@ -32,6 +32,56 @@ If `governance_token` is `None`:
 
 The token balance is checked via the Soroban token client.
 
+## Shared Governance Gating Role Escalation Controls
+
+The repository also includes a reusable helper in `contracts/common/src/governance_gating.rs` for contracts that need governance-token gating outside the `ProtocolDao` contract itself.
+
+### Purpose
+
+This helper separates:
+
+- **ordinary governance power** for standard token-threshold gated actions, and
+- **role escalation power** for privileged actions such as granting high-impact roles, rotating administrative control, or enabling new governance authorities.
+
+### Key controls
+
+- `initialize_governance(token, threshold, enabled)`
+  - Initializes ordinary governance gating.
+  - Also initializes role escalation controls.
+
+- `set_role_escalation_threshold(threshold)`
+  - Sets the minimum power required for privileged role escalation.
+  - Must be greater than or equal to the ordinary governance threshold.
+
+- `set_role_escalation_use_delegated_power(enabled)`
+  - Controls whether delegated voting power counts toward role escalation.
+  - Defaults to `false`.
+
+- `require_governance_threshold(address)`
+  - Ordinary governance gate.
+
+- `require_role_escalation_threshold(address)`
+  - Stricter gate for privileged role or admin escalation flows.
+
+### Delegation semantics
+
+- Delegation is supported for ordinary governance voting power.
+- Delegated balances are snapshotted at delegation time and reconciled on revoke/redelegate.
+- Self-delegation is rejected.
+- By default, delegated voting power does **not** satisfy the role escalation threshold.
+- If a holder's token balance changes while a delegation is active, they should revoke and redelegate to refresh the snapshotted delegated amount.
+
+This default exists to prevent delegated governance power from being used to bootstrap privileged roles unless the integrating contract explicitly opts into that behavior.
+
+### Security model
+
+- **Fail-open for ordinary governance**: `require_governance_threshold` permits operation when governance is uninitialized or disabled so legacy/admin-controlled flows can remain backward compatible.
+- **Fail-closed for role escalation**: `require_role_escalation_threshold` rejects calls when governance is uninitialized or disabled.
+- **Threshold floor invariant**: the role escalation threshold can never be set below the ordinary governance threshold.
+- **Automatic hardening on threshold raises**: if the ordinary governance threshold is raised above the current role escalation threshold, the escalation threshold is automatically raised as well.
+
+These controls are intended for contracts that need stronger guarantees around privilege elevation than ordinary proposal or voting flows require.
+
 ### Core Proposal Actions
 
 `ProposalAction` currently supports:
@@ -151,50 +201,3 @@ Existing admin functions (`configure_fees`, `set_tier_discount`, `set_business_t
 7. On subsequent attestations, the attestation contract resolves the fee configuration via the DAO, falling back to local configuration only if the DAO returns no configuration.
 
 This flow provides an on-chain, token-gated, and quorum-enforced path for adjusting protocol fee parameters.
-
-## Cross-Role Authorization Model
-
-The ProtocolDao enforces a strict cross-role authorization model to maintain governance integrity.
-
-### Role Definitions
-
-| Role | Description | Token Required |
-|------|-------------|----------------|
-| Admin | DAO administrator with elevated privileges | No |
-| Creator | Address that creates a proposal | Yes (if token configured) |
-| Voter | Address that votes for or against proposals | Yes (if token configured) |
-| Executor | Address that executes an approved proposal | No |
-
-### Permission Matrix
-
-| Operation | Admin | Token Holder | Non-Token Holder |
-|-----------|-------|--------------|------------------|
-| `set_governance_token` | Yes | No | No |
-| `set_voting_config` | Yes | No | No |
-| `create_*_proposal` | Via token | Yes | No* |
-| `vote_for` / `vote_against` | Via token | Yes | No* |
-| `execute_proposal` | Yes | Yes | Yes |
-| `cancel_proposal` (own) | Yes | Yes | N/A |
-| `cancel_proposal` (other) | Yes | No | No |
-
-\* When no governance token is configured, anyone can create proposals and vote.
-
-### Authorization Invariants
-
-1. **Token Gating Isolation**: When a governance token is configured, only addresses with a positive token balance can create proposals or vote. The admin role alone does not grant voting privileges.
-
-2. **Cancel Authority**: Only the proposal creator or the DAO admin can cancel a pending proposal. Other token holders cannot cancel proposals they did not create.
-
-3. **Execute Permissionlessness**: Any address can execute a proposal if it meets quorum and has strict majority approval. This enables trustless execution once governance requirements are satisfied.
-
-4. **Vote Finality**: Each address can vote exactly once per proposal. A vote cannot be changed or withdrawn after submission.
-
-5. **Lifecycle Enforcement**: Operations are only valid during the `Pending` status. Once a proposal is `Executed`, `Rejected`, or expired, no further state changes are permitted except read operations.
-
-### Security Assumptions
-
-- The governance token contract is trusted and correctly implements the Soroban token interface.
-- Token balance checks are performed at the time of each operation; balance changes after voting do not affect prior votes.
-- Proposal expiration is determined by ledger sequence comparison, which is monotonically increasing.
-- The admin address is trusted and secured; admin compromise could disrupt governance but cannot bypass quorum requirements for fee configuration changes.
-
