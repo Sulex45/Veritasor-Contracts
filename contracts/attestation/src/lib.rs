@@ -1,7 +1,8 @@
 #![no_std]
-use core::cmp::Ordering;
-use soroban_sdk::{contract, contractimpl, contracttype, Address, BytesN, Env, String, Symbol, Vec};
-use veritasor_common::replay_protection;
+use soroban_sdk::{contract, contractimpl, contracttype, Address, BytesN, Env, String, Vec};
+
+#[cfg(test)]
+mod expiry_test;
 
 /// Attestor staking client: WASM import for wasm32, crate client for host builds.
 #[cfg(target_arch = "wasm32")]
@@ -11,12 +12,6 @@ mod attestor_staking_import {
     );
     pub use Client as AttestorStakingContractClient;
 }
-
-#[cfg(not(target_arch = "wasm32"))]
-use veritasor_attestor_staking::AttestorStakingContractClient;
-
-#[cfg(target_arch = "wasm32")]
-use attestor_staking_import::AttestorStakingContractClient;
 
 const STATUS_KEY_TAG: u32 = 1;
 const ADMIN_KEY_TAG: (u32,) = (2,);
@@ -32,6 +27,7 @@ pub const STATUS_REVOKED: u32 = 1;
 // Type aliases to reduce complexity
 pub type AttestationData = (BytesN<32>, u64, u32, i128, Option<BytesN<32>>, Option<u64>);
 pub type RevocationData = (Address, u64, String);
+pub type AttestationWithRevocation = (AttestationData, Option<RevocationData>);
 pub type AttestationStatusResult = Vec<(String, Option<AttestationData>, Option<RevocationData>)>;
 
 // Feature modules
@@ -95,6 +91,7 @@ impl AttestationContract {
         admin.require_auth();
         replay_protection::verify_and_increment_nonce(&env, &admin, NONCE_CHANNEL_ADMIN, nonce);
         dynamic_fees::set_admin(&env, &admin);
+        access_control::grant_role(&env, &admin, ROLE_ADMIN);
     }
 
     pub fn configure_fees(env: Env, token: Address, collector: Address, base_fee: i128, enabled: bool) {
@@ -183,7 +180,72 @@ impl AttestationContract {
     }
 
     pub fn is_revoked(env: Env, business: Address, period: String) -> bool {
-        false
+        dispute::is_attestation_revoked(&env, &business, &period)
+    }
+
+    /// Returns revocation metadata for an attestation, if it has been revoked.
+    pub fn get_revocation_info(
+        env: Env,
+        business: Address,
+        period: String,
+    ) -> Option<RevocationData> {
+        dispute::get_attestation_revocation(&env, &business, &period)
+    }
+
+    /// Returns attestation data together with optional revocation metadata.
+    pub fn get_attestation_with_status(
+        env: Env,
+        business: Address,
+        period: String,
+    ) -> Option<AttestationWithRevocation> {
+        let attestation = Self::get_attestation(env.clone(), business.clone(), period.clone())?;
+        let revocation = Self::get_revocation_info(env, business, period);
+        Some((attestation, revocation))
+    }
+
+    /// Verifies an attestation against the expected root and revocation status.
+    pub fn verify_attestation(
+        env: Env,
+        business: Address,
+        period: String,
+        merkle_root: BytesN<32>,
+    ) -> bool {
+        match Self::get_attestation(env.clone(), business.clone(), period.clone()) {
+            Some((stored_root, _, _, _, _, _)) => {
+                stored_root == merkle_root && !Self::is_revoked(env, business, period)
+            }
+            None => false,
+        }
+    }
+
+    /// Batch-queries attestation and revocation state for the requested periods.
+    pub fn get_business_attestations(
+        env: Env,
+        business: Address,
+        periods: Vec<String>,
+    ) -> AttestationStatusResult {
+        let mut results = Vec::new(&env);
+        for period in periods.iter() {
+            let attestation = Self::get_attestation(env.clone(), business.clone(), period.clone());
+            let revocation = Self::get_revocation_info(env.clone(), business.clone(), period.clone());
+            results.push_back((period, attestation, revocation));
+        }
+        results
+    }
+
+    /// Verify that an attestation exists and matches the provided merkle root.
+    /// This does NOT check expiry - use is_expired() separately for that.
+    pub fn verify_attestation(
+        env: Env,
+        business: Address,
+        period: String,
+        merkle_root: BytesN<32>,
+    ) -> bool {
+        if let Some((stored_root, _, _, _, _, _)) = Self::get_attestation(env, business, period) {
+            stored_root == merkle_root
+        } else {
+            false
+        }
     }
 
     pub fn revoke_attestation(
@@ -194,9 +256,10 @@ impl AttestationContract {
         reason: String,
         _nonce: u64,
     ) {
-        caller.require_auth();
-        dynamic_fees::require_admin(&env);
-        // Minimal implementation for tests
+        dispute::require_revocation_authorized(&env, &caller, &business, &period);
+        let revoked_at = env.ledger().timestamp();
+        let revocation = (caller.clone(), revoked_at, reason.clone());
+        dispute::store_attestation_revocation(&env, &business, &period, &revocation);
         events::emit_attestation_revoked(&env, &business, &period, &caller, &reason);
     }
 
@@ -209,6 +272,7 @@ impl AttestationContract {
         new_version: u32,
     ) {
         access_control::require_admin(&env, &caller);
+        dispute::require_not_revoked_for_update(&env, &business, &period);
         let key = DataKey::Attestation(business.clone(), period.clone());
         let (old_root, ts, old_ver, fee, proof_hash, expiry): AttestationData = env
             .storage()
@@ -222,6 +286,38 @@ impl AttestationContract {
 
         let data = (new_merkle_root.clone(), ts, new_version, fee, proof_hash, expiry);
         env.storage().instance().set(&key, &data);
+        events::emit_attestation_migrated(
+            &env,
+            &business,
+            &period,
+            &old_root,
+            &new_merkle_root,
+            old_ver,
+            new_version,
+            &caller,
+        );
+    }
+
+    /// Pauses state-changing administrative flows.
+    pub fn pause(env: Env, caller: Address) {
+        caller.require_auth();
+        let caller_is_admin = caller == dynamic_fees::get_admin(&env)
+            || access_control::has_role(&env, &caller, ROLE_ADMIN)
+            || access_control::has_role(&env, &caller, ROLE_OPERATOR);
+        assert!(caller_is_admin, "caller must have ADMIN or OPERATOR role");
+        access_control::set_paused(&env, true);
+        events::emit_paused(&env, &caller);
+    }
+
+    /// Restores state-changing administrative flows.
+    pub fn unpause(env: Env, caller: Address) {
+        caller.require_auth();
+        let caller_is_admin = caller == dynamic_fees::get_admin(&env)
+            || access_control::has_role(&env, &caller, ROLE_ADMIN)
+            || access_control::has_role(&env, &caller, ROLE_OPERATOR);
+        assert!(caller_is_admin, "caller must have ADMIN or OPERATOR role");
+        access_control::set_paused(&env, false);
+        events::emit_unpaused(&env, &caller);
     }
 
     pub fn submit_multi_period_attestation(
@@ -263,12 +359,14 @@ impl AttestationContract {
         timelock_ledgers: u32,
         confirmation_window_ledgers: u32,
         cooldown_ledgers: u32,
+        grace_period_ledgers: u32,
     ) {
         dynamic_fees::require_admin(&env);
         let config = veritasor_common::key_rotation::RotationConfig {
             timelock_ledgers,
             confirmation_window_ledgers,
             cooldown_ledgers,
+            grace_period_ledgers,
         };
         veritasor_common::key_rotation::set_rotation_config(&env, &config);
     }
@@ -378,3 +476,9 @@ impl AttestationContract {
         replay_protection::get_nonce(&env, &actor, channel)
     }
 }
+
+#[cfg(test)]
+mod test;
+
+#[cfg(test)]
+mod revocation_test;
