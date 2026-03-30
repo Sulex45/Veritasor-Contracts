@@ -10,12 +10,12 @@ When fees are not configured or are disabled, attestations remain free — prese
 
 ### Why tiered + volume-based pricing?
 
-| Goal | Mechanism |
-|------|-----------|
-| **Reward loyalty** | Volume discounts reduce per-unit cost as usage grows |
-| **Reward commitment** | Tier discounts let enterprises negotiate better rates |
-| **Predictable revenue** | Deterministic formula — no oracles, no off-chain state |
-| **Fair compounding** | Multiplicative (not additive) discounts preserve protocol revenue at scale |
+| Goal                    | Mechanism                                                                  |
+| ----------------------- | -------------------------------------------------------------------------- |
+| **Reward loyalty**      | Volume discounts reduce per-unit cost as usage grows                       |
+| **Reward commitment**   | Tier discounts let enterprises negotiate better rates                      |
+| **Predictable revenue** | Deterministic formula — no oracles, no off-chain state                     |
+| **Fair compounding**    | Multiplicative (not additive) discounts preserve protocol revenue at scale |
 
 A 20% tier discount combined with a 10% volume discount yields a 28% total discount (not 30%). This multiplicative model ensures the protocol retains more revenue than naive additive discounting while still rewarding both axes of loyalty.
 
@@ -34,13 +34,13 @@ effective_fee = base_fee
 
 ### Worked example
 
-| Parameter | Value |
-|-----------|-------|
-| Base fee | 1 000 000 stroops |
-| Business tier | 1 (Professional) |
-| Tier 1 discount | 2 000 bps (20%) |
-| Attestation count | 12 |
-| Volume bracket ≥10 | 1 000 bps (10%) |
+| Parameter          | Value             |
+| ------------------ | ----------------- |
+| Base fee           | 1 000 000 stroops |
+| Business tier      | 1 (Professional)  |
+| Tier 1 discount    | 2 000 bps (20%)   |
+| Attestation count  | 12                |
+| Volume bracket ≥10 | 1 000 bps (10%)   |
 
 ```
 effective = 1 000 000 × (10 000 − 2 000) × (10 000 − 1 000) ÷ 100 000 000
@@ -52,12 +52,12 @@ effective = 1 000 000 × (10 000 − 2 000) × (10 000 − 1 000) ÷ 100 000 000
 
 Businesses are assigned to tiers by the contract admin. Tiers are identified by `u32` level numbers:
 
-| Tier | Name | Typical discount |
-|------|------|-----------------|
-| 0 | Standard | 0% (default for all businesses) |
-| 1 | Professional | 10–20% |
-| 2 | Enterprise | 30–50% |
-| 3+ | Custom | Admin-defined |
+| Tier | Name         | Typical discount                |
+| ---- | ------------ | ------------------------------- |
+| 0    | Standard     | 0% (default for all businesses) |
+| 1    | Professional | 10–20%                          |
+| 2    | Enterprise   | 30–50%                          |
+| 3+   | Custom       | Admin-defined                   |
 
 The scheme is open-ended — any `u32` tier level can be configured with a discount.
 
@@ -73,6 +73,7 @@ discounts:  [500, 1000, 2000]   (in basis points)
 ```
 
 This means:
+
 - 0–9 attestations: no volume discount
 - 10–49 attestations: 5% volume discount
 - 50–99 attestations: 10% volume discount
@@ -92,46 +93,46 @@ One-time setup. Must be called before any admin method. The `admin` address must
 
 ### Admin Methods (require admin authorization)
 
-| Method | Description |
-|--------|-------------|
+| Method                                                | Description                                                                |
+| ----------------------------------------------------- | -------------------------------------------------------------------------- |
 | `configure_fees(token, collector, base_fee, enabled)` | Set or update the fee token, collector address, base fee, and enabled flag |
-| `set_tier_discount(tier, discount_bps)` | Set the discount for a tier level (0–10 000 bps) |
-| `set_business_tier(business, tier)` | Assign a business to a tier |
-| `set_volume_brackets(thresholds, discounts)` | Set volume discount brackets (parallel vectors, ascending thresholds) |
-| `set_fee_enabled(enabled)` | Toggle fee collection without changing other config |
+| `set_tier_discount(tier, discount_bps)`               | Set the discount for a tier level (0–10 000 bps)                           |
+| `set_business_tier(business, tier)`                   | Assign a business to a tier                                                |
+| `set_volume_brackets(thresholds, discounts)`          | Set volume discount brackets (parallel vectors, ascending thresholds)      |
+| `set_fee_enabled(enabled)`                            | Toggle fee collection without changing other config                        |
 
 ### Core Methods
 
-| Method | Description |
-|--------|-------------|
+| Method                                                                  | Description                                                          |
+| ----------------------------------------------------------------------- | -------------------------------------------------------------------- |
 | `submit_attestation(business, period, merkle_root, timestamp, version)` | Submit attestation; collects fee if enabled; business must authorize |
-| `get_attestation(business, period)` | Returns `(merkle_root, timestamp, version, fee_paid)` |
-| `verify_attestation(business, period, merkle_root)` | Returns `true` if attestation exists and root matches |
+| `get_attestation(business, period)`                                     | Returns `(merkle_root, timestamp, version, fee_paid)`                |
+| `verify_attestation(business, period, merkle_root)`                     | Returns `true` if attestation exists and root matches                |
 
 ### Read-Only Queries
 
-| Method | Description |
-|--------|-------------|
-| `get_fee_config()` | Current fee configuration or None |
-| `get_fee_quote(business)` | Fee the business would pay for its next attestation |
-| `get_business_tier(business)` | Tier assigned to a business (0 if unset) |
-| `get_business_count(business)` | Cumulative attestation count |
-| `get_admin()` | Contract admin address |
+| Method                         | Description                                         |
+| ------------------------------ | --------------------------------------------------- |
+| `get_fee_config()`             | Current fee configuration or None                   |
+| `get_fee_quote(business)`      | Fee the business would pay for its next attestation |
+| `get_business_tier(business)`  | Tier assigned to a business (0 if unset)            |
+| `get_business_count(business)` | Cumulative attestation count                        |
+| `get_admin()`                  | Contract admin address                              |
 
 ## Storage Layout
 
 All data is stored in Soroban instance storage under the `DataKey` enum:
 
-| Key | Value | Description |
-|-----|-------|-------------|
-| `DataKey::Attestation(Address, String)` | `(BytesN<32>, u64, u32, i128)` | Attestation record with fee paid |
-| `DataKey::Admin` | `Address` | Contract administrator |
-| `DataKey::FeeConfig` | `FeeConfig` | Token, collector, base fee, enabled flag |
-| `DataKey::TierDiscount(u32)` | `u32` | Discount bps for a tier level |
-| `DataKey::BusinessTier(Address)` | `u32` | Tier assignment for a business |
-| `DataKey::BusinessCount(Address)` | `u64` | Cumulative attestation count |
-| `DataKey::VolumeThresholds` | `Vec<u64>` | Volume bracket thresholds |
-| `DataKey::VolumeDiscounts` | `Vec<u32>` | Volume bracket discounts |
+| Key                                     | Value                          | Description                              |
+| --------------------------------------- | ------------------------------ | ---------------------------------------- |
+| `DataKey::Attestation(Address, String)` | `(BytesN<32>, u64, u32, i128)` | Attestation record with fee paid         |
+| `DataKey::Admin`                        | `Address`                      | Contract administrator                   |
+| `DataKey::FeeConfig`                    | `FeeConfig`                    | Token, collector, base fee, enabled flag |
+| `DataKey::TierDiscount(u32)`            | `u32`                          | Discount bps for a tier level            |
+| `DataKey::BusinessTier(Address)`        | `u32`                          | Tier assignment for a business           |
+| `DataKey::BusinessCount(Address)`       | `u64`                          | Cumulative attestation count             |
+| `DataKey::VolumeThresholds`             | `Vec<u64>`                     | Volume bracket thresholds                |
+| `DataKey::VolumeDiscounts`              | `Vec<u32>`                     | Volume bracket discounts                 |
 
 ## Configuration Guide
 
@@ -212,116 +213,7 @@ stellar contract invoke --network testnet --source <ADMIN_KEY> \
 - **Economic simulation** (1 test): 30 attestations across 3 businesses at different tiers with volume brackets — verifies exact protocol revenue
 - **Core attestation** (4 tests): Submit, get, verify, duplicate prevention, count increment
 
-### Property Tests (`property_test.rs`) — Fee Monotonicity
-
-Property tests are implemented in two styles:
-
-1. **Proptest macros** for pure functions (no `Env`): generates thousands of random inputs, checks properties, and auto-shrinks failures.
-2. **Parametric contract-state tests** for invariants requiring Soroban `Env`: a representative input matrix iterates over cases with fresh `Env` per case.
-
-#### §A–§J: Core Attestation Invariants (P1–P14, 14 tests)
-
-| ID  | Invariant |
-|-----|-----------|
-| P1  | `0 ≤ compute_fee(b,t,v) ≤ b` for all valid inputs |
-| P2  | `compute_fee(b,0,0) = b`; full discounts yield zero |
-| P3  | `compute_fee` is monotonically non-increasing in each discount axis |
-| P4  | `get_attestation` returns exactly what `submit_attestation` stored |
-| P5  | `get_business_count` increases by exactly 1 per submission |
-| P6  | `verify_attestation` iff `(exists ∧ ¬revoked ∧ stored_root = r)` |
-| P7  | After revocation, `verify_attestation` returns false for **any** root |
-| P8  | Duplicate `(business, period)` always panics |
-| P9  | `migrate_attestation` panics iff `new_version ≤ old_version` |
-| P10 | `set_tier_discount` panics iff `discount_bps > 10_000` |
-| P11 | `set_volume_brackets` panics iff lengths mismatch or thresholds not ascending |
-| P12 | Business A's state never affects Business B's |
-| P13 | Submissions panic with "contract is paused" while paused |
-| P14 | `get_fee_quote()` before submit equals actual token deduction |
-
-#### §K: Pure Arithmetic Fee Monotonicity (P15–P20, 6 proptest properties)
-
-| ID  | Invariant | Security implication |
-|-----|-----------|----------------------|
-| P15 | `compute_fee` is monotonically non-decreasing in `base_fee` | Revenue never decreases as base fee increases |
-| P16 | Multiplicative decomposition: `fee(b,t,v) ≈ fee(b,t,0) × (10_000−v) / 10_000` (±1 truncation) | Validates independence of discount axes |
-| P17 | Discount axis symmetry: `fee(b,t,v) = fee(b,v,t)` | Order of discount application is irrelevant |
-| P18 | Additive over-discounts vs multiplicative: `fee(b,t+v,0) ≤ fee(b,t,v)` | Protocol captures more revenue under multiplicative model |
-| P19 | A positive base increment never decreases the fee | Monotone growth — no fee inversion attacks |
-| P20 | N calls to `compute_fee` sum to N × single call (referential transparency) | Pure function, no hidden state |
-
-#### §L: End-to-End Contract Fee Monotonicity (P21–P23, 3 parametric tests)
-
-| ID  | Invariant | Test scope |
-|-----|-----------|------------|
-| P21 | `get_fee_quote` is monotonically non-increasing as tier level increases | 6 tier levels (0–5), discount 0–100% |
-| P22 | `get_fee_quote` is monotonically non-increasing as count crosses volume brackets | 5 checkpoints (0, 5, 10, 25, 50 submissions) |
-| P23 | `fee_paid` stored in sequential attestation records is monotonically non-increasing | 20 sequential submissions with 3 volume brackets |
-
-#### §M: Combined Tier + Volume Monotonicity (P24–P25, 1 parametric test)
-
-| ID  | Invariant |
-|-----|-----------|
-| P24 | When both tier and volume discounts increase, fee never rises (12-row matrix) |
-| P25 | Every contract quote exactly matches `compute_fee` for the same parameters |
-
-#### §N: Boundary Arithmetic Precision (P26–P28, 3 tests)
-
-| ID  | Invariant |
-|-----|-----------|
-| P26 | 15 exact spot-checks at critical BPS boundaries (0, 1, 9_999, 10_000 bps) |
-| P27 | No i128 overflow at maximum safe base (1 trillion stroops) |
-| P28 | A 1 bps discount strictly reduces the fee for bases ≥ 10_000 |
-
-#### §O: Adversarial Fee Manipulation Resistance (P29–P32, 4 tests)
-
-| ID  | Invariant | Adversarial scenario |
-|-----|-----------|----------------------|
-| P29 | Valid tier assignments (0–10_000 bps) never produce fee > base fee | Admin cannot inflate fees |
-| P30 | Fee toggle on/off produces deterministic, idempotent quotes | No side-effects from toggling |
-| P31 | Volume bracket with threshold=0 applies immediately (count = 0) | New-business edge case coverage |
-| P32 | Rapid tier reassignment converges to last assigned tier | No state leakage from intermediate assignments |
-
-#### §P: Regression and Determinism (P33–P35, 3 tests)
-
-| ID  | Invariant |
-|-----|-----------|
-| P34 | Documented worked example: `compute_fee(1_000_000, 2_000, 1_000) = 720_000` — exact reproduction of the fee formula from this document |
-| P35 | `get_fee_quote` is idempotent: 10 consecutive calls always return the same value without mutating state |
-| P33 | Multi-business revenue regression: 3 businesses × 12 attestations with tier + volume brackets always produces exactly **29_452_500** stroops total protocol revenue |
-
-## Fee Monotonicity: Assumptions and Expected Behavior
-
-### Core Assumptions
-
-1. **Tier discounts are non-decreasing in tier level** — the admin must configure tier discounts such that higher tier numbers correspond to higher (or equal) discount values. The contract does not enforce ordering between tiers; monotonicity is only guaranteed when the admin applies this discipline. Property tests P21 and P24 validate this assumption.
-
-2. **Volume bracket discounts are non-decreasing in threshold order** — enforced by the contract's `set_volume_brackets` validation. Property tests P22 and P11 validate this.
-
-3. **Integer truncation is deterministic** — the fee formula uses integer division (floor). This means the computed fee may be up to 1 stroop less than the exact fractional result. Property test P16 formally bounds this error at ±1, and P26 spot-checks exact values.
-
-4. **`compute_fee` is a pure, stateless function** — it has no storage access and always returns the same output for the same inputs. Property tests P17, P20, and P35 validate referential transparency.
-
-5. **Token transfers are atomic** — if a token transfer fails (insufficient balance or missing approval), the entire `submit_attestation` call reverts. The contract never updates state (count, attestation record) before a successful fee collection.
-
-### Monotonicity Guarantees
-
-| Property | Guarantee | Caveat |
-|----------|-----------|--------|
-| Fee ≤ base fee | Always | — |
-| Fee ≥ 0 | Always | — |
-| Fee non-increasing in tier discount | Always (pure formula) | Requires admin to assign strictly ascending discounts across tiers |
-| Fee non-increasing as volume count grows | Always (pure formula) | Requires volume bracket discounts to be non-decreasing |
-| Fee non-increasing over sequential submissions | Always (contract) | Assumes no tier downgrade and non-decreasing brackets |
-| Multiplicative ≥ additive fee | Always (pure formula) | Only for combined discounts summing to ≤ 10_000 bps |
-
-### Security Notes
-
-- **Negative discount protection**: `set_tier_discount` and `set_volume_brackets` use `u32` parameters — negative discounts are structurally impossible.
-- **Overflow protection**: `i128` with `overflow-checks = true` (see `Cargo.toml`). The maximum intermediate value (1_000_000_000_000 × 10_000 × 10_000 = 10^20) is well within `i128::MAX ≈ 1.7 × 10^38`.
-- **Fee inflation resistance**: Property P29 confirms that no valid discount configuration (0–10_000 bps) can produce a fee above the base fee.
-- **Idempotent queries**: Property P35 confirms `get_fee_quote` has no side effects — it cannot be used to manipulate state.
-
-## Running Tests
+Run tests:
 
 ```bash
 # All tests (unit + property)
@@ -338,3 +230,108 @@ cargo test -- prop_fee_monotone prop_fee_multiplicative prop_fee_discount prop_a
 cargo test -- --nocapture 2>&1 | grep -E "(PASSED|FAILED|running|proptest)"
 ```
 
+---
+
+## Fee Toggle Backward Compatibility Test Matrix
+
+### Backward Compatibility Guarantee
+
+The attestation contract guarantees free attestations in two cases:
+
+1. **No `FeeConfig` stored** — if `configure_fees` has never been called, `get_fee_quote` returns `0` and `submit_attestation` succeeds without requiring any token balance. The stored `fee_paid` field is `0`.
+
+2. **`FeeConfig.enabled = false`** — if fees are explicitly disabled, the contract behaves identically to the no-config case regardless of what `base_fee`, `token`, or `collector` are set to.
+
+This guarantee holds across all toggle state transitions and is validated by the test matrix.
+
+### Fee Toggle State Transitions
+
+The toggle state machine has three states:
+
+```
+         configure_fees(enabled=false)
+              set_fee_enabled(false)
+    +--------------------------------------+
+    |                                      v
+[No Config] --configure_fees--> [Enabled] <-> [Disabled]
+                                           ^
+              set_fee_enabled(true)        |
+              configure_fees(enabled=true) |
+    +--------------------------------------+
+```
+
+**Transition behavior:**
+
+| Transition                                                                | Effect                                         |
+| ------------------------------------------------------------------------- | ---------------------------------------------- |
+| `[Enabled]` → `[Disabled]`                                                | Fees stop immediately on the next submission   |
+| `[Disabled]` → `[Enabled]`                                                | Fees resume immediately on the next submission |
+| No-op toggle (same value)                                                 | Behavior unchanged                             |
+| `[No Config]` → `[Disabled]` via `configure_fees(enabled=false)`          | Config stored, attestations remain free        |
+| `[Disabled]` → `[Enabled]` via `configure_fees(enabled=true, base_fee=X)` | Resumes with new `base_fee`                    |
+
+### Volume Count Accumulation During Disabled Periods
+
+A key behavioral invariant: **the business's cumulative attestation count increments on every successful `submit_attestation` call, regardless of whether fees are enabled.**
+
+```
+submit (enabled=true)  → fee collected, count++
+submit (enabled=false) → fee = 0,       count++   ← count still increments
+submit (enabled=true)  → fee uses total count (including free submissions)
+```
+
+This means:
+
+- Businesses are not penalized for fee pauses — their volume discount progress is preserved.
+- Businesses are not rewarded unfairly — free submissions count toward volume thresholds.
+- When fees are re-enabled, the volume discount applied is based on the **total** cumulative count including all submissions made during the disabled period.
+
+### DAO Config Override Precedence
+
+When a DAO contract address is set via `set_dao(dao_address)`, the DAO-provided fee config takes precedence over the local `FeeConfig`:
+
+| DAO state                                                   | Local config | Effective behavior                                          |
+| ----------------------------------------------------------- | ------------ | ----------------------------------------------------------- |
+| DAO set, returns `FeeConfig { enabled: false }`             | Any          | Free attestations                                           |
+| DAO set, returns `FeeConfig { enabled: true, base_fee: X }` | Any          | Fees collected using DAO's `base_fee`, `token`, `collector` |
+| DAO set, returns `None`                                     | Any          | Falls back to local `FeeConfig`                             |
+| No DAO set                                                  | Any          | Uses local `FeeConfig`                                      |
+
+The DAO override applies to both `get_fee_quote` and `submit_attestation`.
+
+### Security Assumptions Validated by the Test Matrix
+
+| Assumption                                               | Test                                                                                 |
+| -------------------------------------------------------- | ------------------------------------------------------------------------------------ |
+| Only admin can call `set_fee_enabled`                    | `test_non_admin_set_fee_enabled_panics`                                              |
+| Only admin can call `configure_fees`                     | `test_non_admin_configure_fees_panics`                                               |
+| `base_fee < 0` is rejected                               | `test_negative_base_fee_panics`                                                      |
+| `discount_bps > 10_000` is rejected                      | `test_tier_discount_over_100_pct_panics`, `test_volume_discount_over_100_pct_panics` |
+| Non-ascending thresholds are rejected                    | `test_unordered_thresholds_panics`                                                   |
+| Mismatched bracket lengths are rejected                  | `test_mismatched_brackets_panics`                                                    |
+| Insufficient balance reverts the entire transaction      | `test_insufficient_balance_reverts_attestation`                                      |
+| `base_fee = 0` with `enabled = true` is valid (zero fee) | `test_zero_base_fee_enabled_collects_nothing`                                        |
+
+### Updated Test Coverage
+
+**51 tests** covering all original scenarios plus the new test matrix categories:
+
+| Category                                   | Tests | Description                                                                     |
+| ------------------------------------------ | ----- | ------------------------------------------------------------------------------- |
+| Pure arithmetic                            | 7     | `compute_fee` with all discount combinations                                    |
+| Flat fee                                   | 1     | No discounts, full base fee charged                                             |
+| Tier discounts                             | 1     | Standard/Professional/Enterprise fee quotes                                     |
+| Volume brackets                            | 1     | Fee reduction as count crosses thresholds                                       |
+| Combined discounts                         | 1     | Tier + volume multiplicative stacking                                           |
+| Tier upgrade                               | 1     | Mid-usage tier change reflects immediately                                      |
+| Fee toggling (existing)                    | 2     | Basic enable/disable and no-config backward compat                              |
+| Initialization guard                       | 1     | Double-initialize panics                                                        |
+| Quote accuracy                             | 1     | `get_fee_quote` matches actual token deduction                                  |
+| Validation                                 | 5     | Mismatched brackets, unordered thresholds, discount overflow, negative base fee |
+| Economic simulation                        | 1     | 30 attestations across 3 businesses — verifies exact protocol revenue           |
+| **Toggle state transition matrix**         | **5** | All edges of the toggle state machine                                           |
+| **Toggle + tier discount interaction**     | **3** | Tier preservation, upgrade during pause, all-tier-levels                        |
+| **Toggle + volume discount interaction**   | **4** | Count accumulation, bracket crossing, bracket reconfiguration                   |
+| **Adversarial / edge cases**               | **5** | Auth rejection, zero base fee, insufficient balance                             |
+| **DAO config override interaction**        | **4** | DAO disabled/enabled override, no DAO, DAO returns None                         |
+| **Fee calculation determinism (proptest)** | **6** | Bounded, monotone, boundary conditions for `compute_fee`                        |
