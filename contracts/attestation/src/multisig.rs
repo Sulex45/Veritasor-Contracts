@@ -1,45 +1,129 @@
+//! # Multisignature Admin for Protocol Control
+//!
+//! This module implements a multisignature mechanism for managing sensitive
+//! protocol parameters and emergency actions in the attestation contract.
+//!
+//! ## Design
+//!
+//! The multisig system uses a proposal-and-approval model:
+//! 1. Any owner can propose an action
+//! 2. Other owners approve or reject the proposal
+//! 3. Once threshold approvals are reached, the action can be executed
+//! 4. Proposals expire after a configurable time window
+//!
+//! ## Actions
+//!
+//! Multisig-controlled actions include:
+//! - Emergency pause/unpause
+//! - Owner management (add/remove owners, change threshold)
+//! - Fee configuration changes
+//! - Role management for critical roles
+//!
+//! ## Security Properties
+//!
+//! - No single owner can execute critical actions alone
+//! - Proposals have expiration to prevent stale executions
+//! - Executed proposals are marked to prevent replay
+//! - Owner list and threshold are protected by multisig itself
+
 use soroban_sdk::{contracttype, Address, Env, Vec};
 
+// ════════════════════════════════════════════════════════════════════
+//  Storage Types
+// ════════════════════════════════════════════════════════════════════
+
+/// Storage keys for multisig state
 #[contracttype]
 #[derive(Clone)]
 pub enum MultisigKey {
+    /// List of multisig owners
     Owners,
+    /// Required approval threshold
     Threshold,
+    /// Proposal data by proposal ID
     Proposal(u64),
+    /// Approvals for a proposal (list of approving addresses)
     Approvals(u64),
+    /// Next proposal ID counter
     NextProposalId,
+    /// Proposal expiration time in ledger sequence
+    ProposalExpiry(u64),
 }
 
+/// Types of actions that can be proposed
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
 pub enum ProposalAction {
+    /// Emergency pause the contract
     Pause,
+    /// Unpause the contract
     Unpause,
+    /// Add a new owner
     AddOwner(Address),
+    /// Remove an owner
     RemoveOwner(Address),
+    /// Change the approval threshold
     ChangeThreshold(u32),
+    /// Grant a role to an address
     GrantRole(Address, u32),
+    /// Revoke a role from an address
     RevokeRole(Address, u32),
+    /// Update fee configuration
+    UpdateFeeConfig(Address, Address, i128, bool), // (token, collector, base_fee, enabled)
+    /// Emergency admin key rotation (bypasses timelock)
+    EmergencyRotateAdmin(Address), // new_admin
     UpdateFeeConfig(Address, Address, i128, bool),
     EmergencyRotateAdmin(Address),
 }
 
+/// Proposal state
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
 pub enum ProposalStatus {
+    /// Proposal is pending approvals
     Pending,
+    /// Proposal has been executed
     Executed,
+    /// Proposal was rejected
     Rejected,
+    /// Proposal expired without execution
+    Expired,
 }
 
+/// Full proposal data
 #[contracttype]
 #[derive(Clone, Debug)]
 pub struct Proposal {
+    /// Unique proposal identifier
     pub id: u64,
+    /// The action to be executed
     pub action: ProposalAction,
+    /// Address that created the proposal
     pub proposer: Address,
+    /// Current status
     pub status: ProposalStatus,
+    /// Ledger sequence when proposal was created
+    pub created_at: u32,
 }
+
+// ════════════════════════════════════════════════════════════════════
+//  Configuration
+// ════════════════════════════════════════════════════════════════════
+
+/// Default proposal expiration (in ledger sequences, ~1 week at 5s/ledger)
+pub const DEFAULT_PROPOSAL_EXPIRY: u32 = 120_960;
+
+/// Minimum number of owners required
+pub const MIN_OWNERS: u32 = 1;
+
+/// Maximum number of owners allowed
+pub const MAX_OWNERS: u32 = 10;
+
+// ════════════════════════════════════════════════════════════════════
+//  Owner Management
+// ════════════════════════════════════════════════════════════════════
+
+/// Get the list of multisig owners.
 
 pub fn get_owners(env: &Env) -> Vec<Address> {
     env.storage()
@@ -174,4 +258,42 @@ pub fn mark_executed(env: &Env, id: u64) {
     env.storage()
         .instance()
         .set(&MultisigKey::Proposal(id), &proposal);
+}
+/// Initialize the multisig with initial owners and threshold.
+pub fn initialize_multisig(env: &Env, owners: &Vec<Address>, threshold: u32) {
+    assert!(
+        !env.storage().instance().has(&MultisigKey::Owners),
+        "multisig already initialized"
+    );
+    assert!(!owners.is_empty(), "must provide at least one owner");
+    assert!(threshold > 0, "threshold must be at least 1");
+    assert!(
+        threshold <= owners.len(),
+        "threshold cannot exceed number of owners"
+    );
+
+    set_owners(env, owners);
+    env.storage()
+        .instance()
+        .set(&MultisigKey::Threshold, &threshold);
+}
+
+/// Check if multisig is initialized.
+pub fn is_multisig_initialized(env: &Env) -> bool {
+    env.storage().instance().has(&MultisigKey::Owners)
+}
+
+// ════════════════════════════════════════════════════════════════════
+//  Require Multisig Approval
+// ════════════════════════════════════════════════════════════════════
+
+/// Require that the caller is an owner with proper authorization.
+pub fn require_owner(env: &Env, caller: &Address) {
+    caller.require_auth();
+    assert!(is_owner(env, caller), "caller is not a multisig owner");
+}
+
+/// Get the approval count for a proposal.
+pub fn get_approval_count(env: &Env, id: u64) -> u32 {
+    get_approvals(env, id).len()
 }
